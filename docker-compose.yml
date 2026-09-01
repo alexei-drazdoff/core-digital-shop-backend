@@ -1,0 +1,79 @@
+name: digital-shop
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: digital_shop
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d digital_shop']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Runs once, then exits. Everything else waits for it to succeed, so no process
+  # ever starts against a half migrated schema.
+  migrate:
+    build: .
+    command: sh -c "npx tsx src/infrastructure/db/migrate.ts up && npx tsx seeds/seed.ts"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+
+  supplier-a:
+    build: .
+    command: npx tsx src/stubs/supplier/main.ts
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+      SUPPLIER_NAME: supplier_a
+      SUPPLIER_PORT: '4001'
+    ports: ['4001:4001']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  supplier-b:
+    build: .
+    command: npx tsx src/stubs/supplier/main.ts
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+      SUPPLIER_NAME: supplier_b
+      SUPPLIER_PORT: '4002'
+    ports: ['4002:4002']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  api:
+    build: .
+    command: npx tsx src/composition/main-api.ts
+    environment: &app_env
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+      SUPPLIER_A_URL: http://supplier-a:4001
+      SUPPLIER_B_URL: http://supplier-b:4002
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports: ['3000:3000']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Separate from the API on purpose: a supplier that hangs for thirty seconds
+  # must delay a background job, never the payment provider's request.
+  worker:
+    build: .
+    command: npx tsx src/composition/main-worker.ts
+    environment: *app_env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
