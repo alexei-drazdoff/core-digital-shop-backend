@@ -5,6 +5,7 @@
  * what keeps the webhook fast: a supplier that hangs for thirty seconds delays a
  * background job, not the payment provider's request.
  */
+import Fastify from 'fastify';
 import { buildContainer } from './container.js';
 import { buildJobHandlers } from './job-handlers.js';
 import { Worker } from '../infrastructure/queue/worker.js';
@@ -36,13 +37,27 @@ async function main(): Promise<void> {
     );
   }
 
+  // The worker owns the delivery, retry and orphan counters, so it needs a
+  // listener of its own for them to be scrapeable at all.
+  const admin = Fastify({ loggerInstance: logger });
+  admin.get('/health', async () => ({ status: 'ok', role: 'worker' }));
+  admin.get('/metrics', async (_request, reply) => {
+    reply.header('content-type', metrics.registry.contentType);
+    return metrics.render();
+  });
+  await admin.listen({ host: config.API_HOST, port: config.WORKER_METRICS_PORT });
+
   worker.start();
-  logger.info({ concurrency: config.WORKER_CONCURRENCY }, 'worker started');
+  logger.info(
+    { concurrency: config.WORKER_CONCURRENCY, metrics_port: config.WORKER_METRICS_PORT },
+    'worker started',
+  );
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'shutting down worker');
     for (const timer of timers) clearInterval(timer);
     await worker.stop();
+    await admin.close();
     await container.shutdown();
     process.exit(0);
   };

@@ -72,6 +72,9 @@ services:
     build: .
     command: npx tsx src/composition/main-worker.ts
     environment: *app_env
+    # Its own listener, because the delivery and orphan counters live in this
+    # process and are not visible on the API's /metrics.
+    ports: ['3001:3001']
     depends_on:
       migrate: { condition: service_completed_successfully }
 

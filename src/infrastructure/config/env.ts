@@ -40,6 +40,14 @@ const envSchema = z.object({
   CIRCUIT_OPEN_MS: z.coerce.number().int().positive().default(5_000),
 
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).default(4),
+  /**
+   * The worker serves its own health and metrics endpoints here.
+   *
+   * Metrics registries are per process, and delivery, retry and orphan counters
+   * are all incremented in the worker. Without a listener of its own they would
+   * be produced and never scraped.
+   */
+  WORKER_METRICS_PORT: z.coerce.number().int().positive().default(3001),
   WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(200),
   /**
    * A paid order older than this with no delivery is considered stuck and is

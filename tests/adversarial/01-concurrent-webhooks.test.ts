@@ -11,7 +11,7 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { startHarness, type Harness } from '../helpers/harness.js';
-import { PaymentSimulator, buildPayload } from '../../src/stubs/payment-simulator/simulator.js';
+import { buildPayload } from '../../src/stubs/payment-simulator/simulator.js';
 
 describe('criterion 1: 50 concurrent webhooks produce exactly one delivery', () => {
   let harness: Harness;
