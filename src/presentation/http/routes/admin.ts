@@ -77,8 +77,14 @@ export function registerAdminRoutes(app: AppServer, container: Container): void 
   /**
    * Adds stock at a supplier and refreshes the storefront counters.
    *
-   * This is what makes the out_of_stock recovery scenario reproducible: replenish,
-   * then let the sweep drive the parked orders to delivered.
+   * The recovery sweep is run here as a convenience, but note what it can and
+   * cannot do: it only picks up orders that have been still for longer than
+   * STUCK_ORDER_AFTER_MS, so an order that went out_of_stock moments ago is
+   * deliberately not in scope and the report will say ordersRequeued: 0. That
+   * order is reached by the next sweep once it has aged past the threshold, or
+   * immediately via POST /admin/orders/:id/redeliver, which does not consult the
+   * deadline. The wait is the point: it keeps the sweep from racing the worker
+   * that is still holding the order.
    */
   app.post('/admin/inventory/replenish', async (request, reply) => {
     const body = replenishBody.parse(request.body);

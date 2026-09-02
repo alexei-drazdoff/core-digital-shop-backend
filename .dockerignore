@@ -1,0 +1,25 @@
+# Keep the build context small and the image reproducible: nothing here is used
+# by the build, and a host node_modules would shadow the one npm ci produces.
+node_modules/
+dist/
+coverage/
+
+.git/
+.github/
+.gitignore
+
+docs/
+tests/
+scripts/
+README.md
+
+.env
+.env.local
+*.log
+.pgdata/
+.DS_Store
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

@@ -1,82 +1,140 @@
 name: digital-shop
 
+# All five application services run the same image, so it is declared once here
+# and built once by the migrate service below. Repeating `build:` on each of them
+# would have Compose export the same tag five times concurrently, which races and
+# fails with "image already exists".
+x-app: &app
+  image: digital-shop:local
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ['/tmp']
+  security_opt: ['no-new-privileges:true']
+  logging:
+    driver: json-file
+    options: { max-size: '10m', max-file: '3' }
+
+# DATABASE_URL is fixed rather than interpolated: a developer's .env points at
+# 127.0.0.1 for the non-docker flow, and letting that leak in here would send
+# every container at the host instead of the postgres service.
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-digital_shop}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # pino-pretty is a devDependency and is deliberately absent from the runtime
+  # image. Containers emit structured JSON; pretty logs belong to `npm run dev`.
+  LOG_PRETTY: 'false'
+  SUPPLIER_A_URL: http://supplier-a:4001
+  SUPPLIER_B_URL: http://supplier-b:4002
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: digital_shop
-    ports: ['5432:5432']
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-digital_shop}
+    # Bound to the loopback interface: the database is a detail of this stack,
+    # not something to publish on every interface of the host.
+    ports: ['127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432']
     volumes: ['pgdata:/var/lib/postgresql/data']
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d digital_shop']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-digital_shop}']
       interval: 2s
       timeout: 3s
       retries: 20
+    logging:
+      driver: json-file
+      options: { max-size: '10m', max-file: '3' }
 
   # Runs once, then exits. Everything else waits for it to succeed, so no process
   # ever starts against a half migrated schema.
+  #
+  # It also owns the build for the whole stack. Every other application service
+  # depends on it, so it is always part of the graph and the tag is guaranteed to
+  # exist before anything that reuses it starts.
   migrate:
-    build: .
-    command: sh -c "npx tsx src/infrastructure/db/migrate.ts up && npx tsx seeds/seed.ts"
-    environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+    <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: 'no'
+    command: ['sh', '-c', 'node dist/src/infrastructure/db/migrate.js up && node dist/seeds/seed.js']
+    environment: *app-env
     depends_on:
       postgres: { condition: service_healthy }
-    restart: 'no'
 
   supplier-a:
-    build: .
-    command: npx tsx src/stubs/supplier/main.ts
+    <<: *app
+    command: ['node', 'dist/src/stubs/supplier/main.js']
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+      <<: *app-env
       SUPPLIER_NAME: supplier_a
       SUPPLIER_PORT: '4001'
-    ports: ['4001:4001']
+    ports: ['127.0.0.1:${SUPPLIER_A_HOST_PORT:-4001}:4001']
     depends_on:
       migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:4001/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   supplier-b:
-    build: .
-    command: npx tsx src/stubs/supplier/main.ts
+    <<: *app
+    command: ['node', 'dist/src/stubs/supplier/main.js']
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
+      <<: *app-env
       SUPPLIER_NAME: supplier_b
       SUPPLIER_PORT: '4002'
-    ports: ['4002:4002']
+    ports: ['127.0.0.1:${SUPPLIER_B_HOST_PORT:-4002}:4002']
     depends_on:
       migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:4002/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   api:
-    build: .
-    command: npx tsx src/composition/main-api.ts
-    environment: &app_env
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/digital_shop
-      SUPPLIER_A_URL: http://supplier-a:4001
-      SUPPLIER_B_URL: http://supplier-b:4002
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-    ports: ['3000:3000']
+    <<: *app
+    command: ['node', 'dist/src/composition/main-api.js']
+    environment: *app-env
+    ports: ['${API_HOST_PORT:-3000}:3000']
     depends_on:
       migrate: { condition: service_completed_successfully }
+      supplier-a: { condition: service_healthy }
+      supplier-b: { condition: service_healthy }
     healthcheck:
       test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/health || exit 1']
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 10s
 
   # Separate from the API on purpose: a supplier that hangs for thirty seconds
   # must delay a background job, never the payment provider's request.
   worker:
-    build: .
-    command: npx tsx src/composition/main-worker.ts
-    environment: *app_env
-    # Its own listener, because the delivery and orphan counters live in this
-    # process and are not visible on the API's /metrics.
-    ports: ['3001:3001']
+    <<: *app
+    command: ['node', 'dist/src/composition/main-worker.js']
+    environment: *app-env
+    # Its own listener, because the delivery, retry and orphan counters live in
+    # this process and are not visible on the API's /metrics.
+    ports: ['127.0.0.1:${WORKER_METRICS_HOST_PORT:-3001}:3001']
     depends_on:
       migrate: { condition: service_completed_successfully }
+    # Long enough for an in-flight delivery to finish rather than be cut in half.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3001/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
 volumes:
   pgdata:
