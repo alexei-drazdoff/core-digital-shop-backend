@@ -78,17 +78,27 @@ export class PgReconciliationRepository implements ReconciliationRepository {
   /**
    * Paid, past the deadline, and with no delivery row. NOT LEFT JOIN on a large
    * table but an anti join on the unique index, so it stays cheap.
+   *
+   * The deadline is measured from paid_at, not from updated_at. Using updated_at
+   * here made the report blind to exactly the orders it exists to catch: the
+   * recovery sweep retries a stuck order every scan, each retry transitions the
+   * status and writes updated_at = now(), and the row drops back out of the
+   * window before anybody sees it. An order that cannot be delivered would then
+   * flip in and out of the report forever while the endpoint kept answering
+   * healthy. How long the customer has been waiting is a property of when the
+   * money arrived, and nothing the retry loop does should reset it.
    */
   private async paidNotDelivered(staleAfter: Date): Promise<ReconciliationRow[]> {
     const result = await this.exec.query<RawRow>(
       `SELECT o.id AS order_id, o.sku, o.status, o.amount_minor,
-              'paid but no delivery recorded' AS detail, o.updated_at AS since
+              'paid but no delivery recorded' AS detail,
+              COALESCE(o.paid_at, o.updated_at) AS since
          FROM orders o
     LEFT JOIN deliveries d ON d.order_id = o.id
         WHERE o.status IN ('paid', 'delivering', 'out_of_stock', 'delivery_failed')
           AND d.order_id IS NULL
-          AND o.updated_at < $1
-        ORDER BY o.updated_at`,
+          AND COALESCE(o.paid_at, o.updated_at) < $1
+        ORDER BY COALESCE(o.paid_at, o.updated_at)`,
       [staleAfter],
     );
     return toRows(result.rows);
