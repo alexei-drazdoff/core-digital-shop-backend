@@ -229,6 +229,12 @@ curl -s "http://127.0.0.1:3000/orders/$ORDER" | jq -r .status   # delivered
 
 ## API
 
+Спецификация OpenAPI 3.0 лежит в [docs/openapi.yaml](docs/openapi.yaml): все
+методы ниже с параметрами, телами, кодами ответов и формами ошибок. Чтобы
+посмотреть её отрисованной, вставьте
+[raw-ссылку](https://raw.githubusercontent.com/alexei-drazdoff/core-digital-shop-backend/main/docs/openapi.yaml)
+в [editor.swagger.io](https://editor.swagger.io/).
+
 Публичные методы.
 
 | Метод | Путь | Что делает |
@@ -309,6 +315,9 @@ npm run bench:catalog
 [docs/SCALING.md](docs/SCALING.md) отвечает на вопрос про масштабирование.
 
 [docs/EXPLAIN.md](docs/EXPLAIN.md) разбирает план запроса витрины.
+
+[docs/openapi.yaml](docs/openapi.yaml) — спецификация OpenAPI 3.0 на весь
+публичный и административный API.
 
 Исходное техническое задание лежит рядом, в
 [docs/Тестовое задание. Бэкенд разработчик.docx](docs/%D0%A2%D0%B5%D1%81%D1%82%D0%BE%D0%B2%D0%BE%D0%B5%20%D0%B7%D0%B0%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5.%20%D0%91%D1%8D%D0%BA%D0%B5%D0%BD%D0%B4%20%D1%80%D0%B0%D0%B7%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D1%87%D0%B8%D0%BA.docx),

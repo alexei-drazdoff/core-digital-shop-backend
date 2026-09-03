@@ -1,0 +1,936 @@
+openapi: 3.0.3
+
+info:
+  title: Ядро магазина цифровых товаров
+  version: 1.0.0
+  description: |
+    Бэкенд площадки цифровых товаров: каталог, заказы, приём оплаты по вебхуку,
+    автоматическая выдача ключей через поставщиков, сверка и восстановление.
+
+    Денежные суммы везде целые, в минорных единицах валюты (копейках).
+    Все временные метки — ISO 8601 со смещением.
+
+    Воркер выдачи слушает отдельно, по умолчанию на порту 3001, и отдаёт там
+    свои `/health` и `/metrics` с теми же контрактами, что описаны здесь.
+    Реестр метрик у каждого процесса свой, поэтому счётчики выдач и повторов
+    видны именно на порту воркера.
+
+servers:
+  - url: http://127.0.0.1:3000
+    description: Локальный стенд
+
+tags:
+  - name: catalog
+    description: Витрина
+  - name: orders
+    description: Заказы
+  - name: webhooks
+    description: Приём событий оплаты
+  - name: admin
+    description: Сверка, журнал денег и восстановление
+  - name: ops
+    description: Проверки живости и метрики
+
+paths:
+  /health:
+    get:
+      tags: [ops]
+      summary: Проверка живости
+      description: Отвечает всегда, пока процесс жив. Базу не трогает.
+      responses:
+        '200':
+          description: Процесс жив
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                required: [status]
+
+  /ready:
+    get:
+      tags: [ops]
+      summary: Проверка готовности
+      description: Выполняет `SELECT 1`, поэтому отличает живой процесс от готового обслуживать запросы.
+      responses:
+        '200':
+          description: База отвечает
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ready]
+                required: [status]
+        '503':
+          description: База недоступна
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [not_ready]
+                required: [status]
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Метрики Prometheus
+      responses:
+        '200':
+          description: Метрики в текстовом формате Prometheus
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /catalog/products:
+    get:
+      tags: [catalog]
+      summary: Витрина товаров
+      description: |
+        Горячий запрос витрины. Пагинация keyset, а не OFFSET: курсор несёт
+        последнюю пару `(sort_rank, id)`, поэтому глубокая страница стоит
+        столько же, сколько первая. Разбор плана — в `docs/EXPLAIN.md`.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ProductType'
+        - name: limit
+          in: query
+          required: false
+          description: Размер страницы.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 24
+        - name: in_stock
+          in: query
+          required: false
+          description: |
+            Строка, а не булево: на проводе допустимы только `"true"` и `"false"`.
+            По умолчанию витрина показывает лишь товары в наличии.
+          schema:
+            type: string
+            enum: ['true', 'false']
+            default: 'true'
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачный курсор вида `<sortRank>.<id>`, взятый из `next_cursor` предыдущей страницы.
+          schema:
+            type: string
+            pattern: '^-?\d+\.\d+$'
+      responses:
+        '200':
+          description: Страница витрины
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StorefrontItem'
+                  next_cursor:
+                    type: string
+                    nullable: true
+                    description: |
+                      `null`, когда страница оказалась неполной. Это признак конца
+                      выборки, из-за которого клиенту не нужен отдельный COUNT.
+                required: [items, next_cursor]
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /catalog/products/{sku}:
+    get:
+      tags: [catalog]
+      summary: Карточка товара
+      parameters:
+        - name: sku
+          in: path
+          required: true
+          schema:
+            type: string
+          example: KEY-GTA5
+      responses:
+        '200':
+          description: Товар найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCard'
+        '404':
+          description: Товар не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: product_not_found
+
+  /orders:
+    post:
+      tags: [orders]
+      summary: Создание заказа
+      description: |
+        Повтор с тем же `Idempotency-Key` возвращает исходный заказ и код `200`
+        вместо `201`, поэтому клиент отличает повтор от нового создания. Тот же
+        ключ с другим телом — конфликт, а не молчаливая перезапись.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Клиентский ключ идемпотентности.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Заказ создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSummary'
+        '200':
+          description: Повтор по тому же `Idempotency-Key`, возвращён исходный заказ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSummary'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          description: Неизвестный SKU
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: product_not_found
+                message: unknown sku KEY-NOPE
+        '409':
+          description: |
+            Товар снят с продажи (`product_inactive`) либо тот же
+            `Idempotency-Key` уже использован с другим телом (`idempotency_conflict`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: idempotency_conflict
+                message: idempotency key 6f1c0a7e was already used with a different request body
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Заказ, выданный код и журнал обращений к поставщикам
+      description: |
+        `supplier_requests` вынесен наружу намеренно: он делает историю выдачи
+        проверяемой без доступа к базе, а значит воспроизводимыми — состязательные
+        сценарии из задания.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: ord_01JQ8ZK3
+      responses:
+        '200':
+          description: Заказ найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '404':
+          description: Заказ не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: order_not_found
+
+  /webhooks/payment:
+    post:
+      tags: [webhooks]
+      summary: Вебхук оплаты
+      description: |
+        Контракт из задания. Доставка at-least-once и возможен приход не по
+        порядку, поэтому обработчик устроен так:
+
+        идемпотентность обеспечивает первичный ключ по `event_id`, а не проверка
+        перед вставкой; неизвестный заказ откладывается и получает `200`, а не
+        отказ; поставщик на этом пути не вызывается вообще, так что время ответа
+        не зависит от третьей стороны.
+
+        `5xx` зарезервирован для настоящего сбоя записи события — ровно того
+        случая, когда повтор от платёжной системы желателен.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhook'
+      responses:
+        '200':
+          description: Событие принято
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                    enum: [true]
+                  outcome:
+                    type: string
+                    enum: [applied, duplicate, deferred, ignored]
+                    description: |
+                      `applied` — заказ переведён дальше по жизненному циклу;
+                      `duplicate` — событие с таким `event_id` уже обработано;
+                      `deferred` — заказ ещё не существует, событие отложено;
+                      `ignored` — событие не применимо (заказ финальный, устаревшее
+                      событие или сумма не совпала с ценой).
+                required: [received, outcome]
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          description: Событие не удалось записать, платёжной системе следует повторить
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: internal_error
+
+  /admin/reconciliation:
+    get:
+      tags: [admin]
+      summary: Отчёт сверки
+      description: |
+        Отвечает на вопросы «оплачен, но не выдан» и «выдан, но не оплачен»,
+        плюс незакрытые обращения к поставщикам и проверку баланса журнала.
+
+        Код ответа сам по себе является результатом: `200` при отсутствии
+        расхождений и `409` при их наличии, поэтому эндпоинт можно завести в
+        монитор, не разбирая тело.
+
+        Порог «просроченности» отсчитывается от момента оплаты, а не от последней
+        попытки выдачи: иначе повторы сдвигали бы отсчёт и прятали бы от отчёта
+        именно те заказы, которые система безуспешно чинит.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Расхождений нет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationReport'
+        '409':
+          description: Есть расхождения, тело той же формы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/ledger/balance:
+    get:
+      tags: [admin]
+      summary: Остатки по счетам и проверка баланса
+      description: |
+        `revenue` и `cogs` кредитовые по своей природе, поэтому читаются как
+        отрицательные знаковые суммы. Значение имеет не знак, а то, что каждая
+        группа проводок сходится в ноль — это и доказывает `imbalanced_groups`.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Состояние журнала
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  by_account:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AccountBalance'
+                  imbalanced_groups:
+                    type: array
+                    description: Всегда должен быть пуст. Непустой означает, что инвариант двойной записи нарушен.
+                    items:
+                      $ref: '#/components/schemas/GroupImbalance'
+                  balanced:
+                    type: boolean
+                required: [by_account, imbalanced_groups, balanced]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/orders/{id}/redeliver:
+    post:
+      tags: [admin]
+      summary: Повторная постановка заказа на выдачу
+      description: |
+        Безопасно: только ставит задачу в очередь. В отличие от фоновой свёртки
+        не смотрит на порог `STUCK_ORDER_AFTER_MS`, поэтому это способ починить
+        заказ немедленно, не дожидаясь его старения.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Задача поставлена либо уже стояла
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id:
+                    type: string
+                  enqueued:
+                    type: boolean
+                    description: '`false`, если живая задача по этому заказу уже была в очереди.'
+                  status:
+                    $ref: '#/components/schemas/OrderStatus'
+                required: [order_id, enqueued, status]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Заказ не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: order_not_found
+
+  /admin/recover:
+    post:
+      tags: [admin]
+      summary: Ручной запуск подчистки зависших заказов
+      description: |
+        Запускает ту же свёртку, что и по таймеру. Берёт только заказы,
+        простоявшие дольше `STUCK_ORDER_AFTER_MS`: ожидание здесь не случайность,
+        оно не даёт свёртке соревноваться с воркером, который прямо сейчас
+        держит заказ.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Результат прогона
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/inventory/replenish:
+    post:
+      tags: [admin]
+      summary: Пополнение пула ключей у поставщика
+      description: |
+        Пополняет остаток на заглушке поставщика, затем синхронизирует счётчики
+        витрины и прогоняет свёртку.
+
+        Обратите внимание на границы: заказ, только что ушедший в `out_of_stock`,
+        в свёртку не попадёт и в отчёте будет `ordersRequeued: 0`. Он будет
+        подобран следующим проходом, когда состарится сверх порога, либо сразу
+        через `POST /admin/orders/{id}/redeliver`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplenishRequest'
+      responses:
+        '200':
+          description: Остаток пополнен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supplier:
+                    type: string
+                  sku:
+                    type: string
+                  added:
+                    type: integer
+                  synced:
+                    $ref: '#/components/schemas/StockSyncReport'
+                  recovered:
+                    $ref: '#/components/schemas/RecoveryReport'
+                required: [supplier, sku, added, synced, recovered]
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: Поставщик не принял пополнение
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: [supplier_replenish_failed]
+                  status:
+                    type: integer
+                    description: Код ответа поставщика.
+                required: [error, status]
+
+  /admin/sync-stock:
+    post:
+      tags: [admin]
+      summary: Синхронизация остатков витрины
+      description: |
+        Пересчитывает флаг наличия у товаров. Флаг меняется лишь при переходе
+        остатка через ноль, поэтому его держат в частичном покрывающем индексе,
+        а точный остаток считают из пула ключей.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Число обновлённых товаров
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockSyncReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Общий статический токен из `ADMIN_TOKEN`. Достаточно, чтобы убрать
+        операционные методы с публичной поверхности, и не притворяется
+        настоящей системой идентификации.
+
+  responses:
+    ValidationFailed:
+      description: Тело или параметры запроса не прошли валидацию
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                enum: [validation_failed]
+              details:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+                    message:
+                      type: string
+                  required: [path, message]
+            required: [error, details]
+          example:
+            error: validation_failed
+            details:
+              - path: amount
+                message: Expected number, received string
+
+    Unauthorized:
+      description: 'Отсутствует или неверен заголовок `Authorization: Bearer <ADMIN_TOKEN>`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: unauthorized
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Машиночитаемый код ошибки.
+        message:
+          type: string
+          description: Пояснение. Отсутствует у ошибок, которые нечего пояснять.
+      required: [error]
+
+    ProductType:
+      type: string
+      enum: [topup, key, subscription, giftcard]
+
+    OrderStatus:
+      type: string
+      enum:
+        - created
+        - paid
+        - delivering
+        - delivered
+        - payment_failed
+        - out_of_stock
+        - delivery_failed
+      description: |
+        `delivered` и `payment_failed` финальные, их не покидают.
+        `out_of_stock` и `delivery_failed` восстановимые: деньги уже получены,
+        поэтому заказ доводят до выдачи, а не бросают.
+
+    SupplierRequestState:
+      type: string
+      enum: [in_flight, succeeded, failed_definitive, unknown]
+      description: |
+        `unknown` — это и есть ловушка таймаута: ответ не дошёл, но поставщик мог
+        успеть выдать код. Отличается от `failed_definitive` намеренно, потому что
+        повтор по этим двум состояниям должен вести себя по-разному.
+
+    StorefrontItem:
+      type: object
+      properties:
+        sku:
+          type: string
+        name:
+          type: string
+        type:
+          $ref: '#/components/schemas/ProductType'
+        price:
+          type: integer
+          description: Цена в минорных единицах.
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+        image:
+          type: string
+        available:
+          type: integer
+          description: Остаток, выведенный из пула ключей.
+      required: [sku, name, type, price, currency, image, available]
+
+    ProductCard:
+      allOf:
+        - $ref: '#/components/schemas/StorefrontItem'
+        - type: object
+          properties:
+            is_active:
+              type: boolean
+          required: [is_active]
+
+    CreateOrderRequest:
+      type: object
+      properties:
+        sku:
+          type: string
+          minLength: 1
+          maxLength: 64
+        customer_ref:
+          type: string
+          maxLength: 200
+        order_id:
+          type: string
+          pattern: '^ord_[A-Za-z0-9_-]{1,64}$'
+          description: |
+            Необязательный клиентский идентификатор. Нужен затем, чтобы платёжной
+            стороне можно было сообщить id до того, как строка заказа появится
+            здесь, — именно это делает воспроизводимым сценарий с ранним вебхуком.
+            Валидируется, а не принимается на веру.
+      required: [sku]
+      example:
+        sku: KEY-GTA5
+        customer_ref: user-42
+
+    OrderSummary:
+      type: object
+      properties:
+        order_id:
+          type: string
+        sku:
+          type: string
+        amount:
+          type: integer
+        currency:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        created_at:
+          type: string
+          format: date-time
+      required: [order_id, sku, amount, currency, status, created_at]
+
+    OrderDetail:
+      type: object
+      properties:
+        order_id:
+          type: string
+        sku:
+          type: string
+        amount:
+          type: integer
+        currency:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        created_at:
+          type: string
+          format: date-time
+        paid_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivery:
+          nullable: true
+          description: Появляется только после того, как выдача зафиксирована в базе.
+          allOf:
+            - $ref: '#/components/schemas/Delivery'
+        supplier_requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/SupplierRequestSummary'
+      required:
+        - order_id
+        - sku
+        - amount
+        - currency
+        - status
+        - created_at
+        - paid_at
+        - delivered_at
+        - delivery
+        - supplier_requests
+
+    Delivery:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Выданный ключ. Это и есть товар.
+        supplier:
+          type: string
+        delivered_at:
+          type: string
+          format: date-time
+      required: [code, supplier, delivered_at]
+
+    SupplierRequestSummary:
+      type: object
+      properties:
+        supplier:
+          type: string
+        request_id:
+          type: string
+          description: |
+            Выводится из пары (заказ, поставщик), а не генерируется на каждую
+            попытку. Поэтому повтор после таймаута приходит к поставщику с тем же
+            идентификатором и получает тот же код, а не новый.
+        state:
+          $ref: '#/components/schemas/SupplierRequestState'
+        attempts:
+          type: integer
+      required: [supplier, request_id, state, attempts]
+
+    PaymentWebhook:
+      type: object
+      properties:
+        event_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Уникален для события. Повтор доставки приходит с тем же значением.
+        order_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+        status:
+          type: string
+          enum: [paid, failed]
+        amount:
+          type: integer
+          minimum: 0
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 обязательно со смещением.
+      required: [event_id, order_id, status, amount, currency, created_at]
+      example:
+        event_id: evt_a1b2c3
+        order_id: ord_00123
+        status: paid
+        amount: 1990
+        currency: RUB
+        created_at: '2026-09-01T12:00:00Z'
+
+    ReplenishRequest:
+      type: object
+      properties:
+        sku:
+          type: string
+          minLength: 1
+        supplier:
+          type: string
+          description: По умолчанию основной поставщик.
+        count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 10
+      required: [sku]
+
+    StockSyncReport:
+      type: object
+      properties:
+        updated:
+          type: integer
+      required: [updated]
+
+    RecoveryReport:
+      type: object
+      properties:
+        ordersRequeued:
+          type: integer
+        deferredEventsRequeued:
+          type: integer
+          description: Вебхуки, пришедшие раньше своего заказа и теперь применённые.
+        abandonedJobsRequeued:
+          type: integer
+      required: [ordersRequeued, deferredEventsRequeued, abandonedJobsRequeued]
+
+    ReconciliationRow:
+      type: object
+      description: Ключи вложенных строк отчёта в camelCase, в отличие от полей верхнего уровня.
+      properties:
+        orderId:
+          type: string
+        sku:
+          type: string
+        status:
+          type: string
+        amountMinor:
+          type: integer
+        detail:
+          type: string
+        since:
+          type: string
+          format: date-time
+      required: [orderId, sku, status, amountMinor, detail, since]
+
+    AccountBalance:
+      type: object
+      properties:
+        account:
+          type: string
+          enum: [psp_cash, revenue, cogs, supplier_payable, shrinkage]
+        signedMinor:
+          type: integer
+      required: [account, signedMinor]
+
+    GroupImbalance:
+      type: object
+      properties:
+        groupId:
+          type: string
+        signedMinor:
+          type: integer
+      required: [groupId, signedMinor]
+
+    ReconciliationReport:
+      type: object
+      description: Каждое поле — вопрос, который задают после инцидента, и пустой список является здоровым ответом.
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        healthy:
+          type: boolean
+        stale_after:
+          type: string
+          format: date-time
+          description: Граница, старше которой заказ считается просроченным.
+        paid_not_delivered:
+          type: array
+          description: Деньги взяты, товар не отдан. То, что стоит доверия клиента.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        delivered_not_paid:
+          type: array
+          description: Товар отдан без подтверждённой оплаты. То, что стоит денег.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        unresolved_supplier_requests:
+          type: array
+          description: Обращения с неизвестным исходом, за которыми может стоять молча списанный остаток.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        orphan_issuances:
+          type: array
+          description: Остаток израсходован без продажи за ним, уже списан в shrinkage.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        deferred_payment_events:
+          type: array
+          description: Вебхуки, пришедшие раньше своего заказа и всё ещё ожидающие.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        dead_jobs:
+          type: array
+          description: Задачи, исчерпавшие повторы. Видны, а не потеряны молча.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        ledger_imbalances:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupImbalance'
+        ledger_by_account:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountBalance'
+      required:
+        - generated_at
+        - healthy
+        - stale_after
+        - paid_not_delivered
+        - delivered_not_paid
+        - unresolved_supplier_requests
+        - orphan_issuances
+        - deferred_payment_events
+        - dead_jobs
+        - ledger_imbalances
+        - ledger_by_account

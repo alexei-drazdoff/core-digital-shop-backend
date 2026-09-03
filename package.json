@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Core backend for a digital goods marketplace: catalog, orders, payment webhooks, automatic key delivery",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -25,7 +27,6 @@
   },
   "dependencies": {
     "fastify": "^5.2.1",
-    "fastify-type-provider-zod": "^4.0.2",
     "pg": "^8.13.1",
     "pino": "^9.6.0",
     "prom-client": "^15.1.3",
