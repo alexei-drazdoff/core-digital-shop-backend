@@ -24,6 +24,7 @@ import type {
   PaymentEventOutcome,
   PaymentEventRepository,
 } from '../ports/repositories.js';
+import type { OrderEventRepository } from '../ports/history.js';
 import type { TransactionScope, UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 
@@ -50,6 +51,7 @@ export class ApplyPaymentEventUseCase {
       uow: UnitOfWork;
       orders: OrderRepository;
       orderItems: OrderItemRepository;
+      orderEvents: OrderEventRepository;
       paymentEvents: PaymentEventRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
@@ -92,7 +94,7 @@ export class ApplyPaymentEventUseCase {
 
   /** Everything both paths share, once the event is exclusively held. */
   private async applyToOrder(tx: TransactionScope, event: IncomingPaymentEvent): Promise<ApplyPaymentResult> {
-    const { orders, orderItems, paymentEvents, ledger, queue, logger } = this.deps;
+    const { orders, orderItems, orderEvents, paymentEvents, ledger, queue, logger } = this.deps;
 
     // Serialises distinct events racing for the same order. No supplier call
     // ever happens while this lock is held, so it cannot be pinned by a timeout.
@@ -152,6 +154,18 @@ export class ApplyPaymentEventUseCase {
       // still the same atomic fact as before, just wider — "paid" and "every
       // line scheduled" commit together, so no line can be paid for and
       // forgotten.
+      // occurredAt is the provider's timestamp, recorded_at is now. Keeping
+      // them apart is what stops a late webhook from making the history claim we
+      // knew about the money before we did.
+      await orderEvents.append(tx, [
+        {
+          orderId: order.id,
+          type: 'payment_captured',
+          payload: { amountMinor: order.amountMinor, currency: order.currency, eventId: event.eventId },
+          occurredAt: event.occurredAt,
+        },
+      ]);
+
       const items = await orderItems.findByOrder(tx, order.id);
       for (const item of items) {
         await queue.enqueue(tx, {
@@ -163,6 +177,17 @@ export class ApplyPaymentEventUseCase {
           priority: JOB_PRIORITY.PAID_DELIVERY,
         });
       }
+    }
+
+    if (decision.nextStatus === 'payment_failed') {
+      await orderEvents.append(tx, [
+        {
+          orderId: order.id,
+          type: 'payment_failed',
+          payload: { eventId: event.eventId },
+          occurredAt: event.occurredAt,
+        },
+      ]);
     }
 
     await paymentEvents.markProcessed(tx, event.eventId, 'applied');

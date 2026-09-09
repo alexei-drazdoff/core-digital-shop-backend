@@ -14,6 +14,7 @@ import type {
   PaymentEventRepository,
   ProductRepository,
 } from '../ports/repositories.js';
+import type { OrderEventRepository } from '../ports/history.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 import type { ApplyPaymentEventUseCase } from './apply-payment-event.js';
@@ -82,6 +83,7 @@ export class CreateOrderUseCase {
       products: ProductRepository;
       orders: OrderRepository;
       orderItems: OrderItemRepository;
+      orderEvents: OrderEventRepository;
       paymentEvents: PaymentEventRepository;
       idempotency: IdempotencyRepository;
       applyPaymentEvent: ApplyPaymentEventUseCase;
@@ -91,7 +93,8 @@ export class CreateOrderUseCase {
   ) {}
 
   async execute(input: CreateOrderInput): Promise<CreateOrderResult> {
-    const { uow, orders, orderItems, paymentEvents, idempotency, applyPaymentEvent, clock, logger } = this.deps;
+    const { uow, orders, orderItems, orderEvents, paymentEvents, idempotency, applyPaymentEvent, clock, logger } =
+      this.deps;
 
     if (input.idempotencyKey) {
       const replay = await this.replay(input);
@@ -132,6 +135,24 @@ export class CreateOrderUseCase {
         if (!claimed) return null;
       }
       await orders.insert(tx, order, items);
+      // The first fact. Carries the lines and their prices, because a
+      // reconstruction has to know what the basket WAS, and the catalog will
+      // have moved on by the time anybody asks.
+      await orderEvents.append(tx, [
+        {
+          orderId: order.id,
+          type: 'order_created',
+          payload: {
+            amountMinor: order.amountMinor,
+            currency: order.currency,
+            items: items.map((item) => ({
+              orderItemId: item.id,
+              sku: item.sku,
+              priceMinor: item.priceMinor,
+            })),
+          },
+        },
+      ]);
       return order;
     });
 

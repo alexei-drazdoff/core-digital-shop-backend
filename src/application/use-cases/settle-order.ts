@@ -32,6 +32,7 @@ import type {
   OrderRepository,
   RefundRepository,
 } from '../ports/repositories.js';
+import type { OrderEventRepository } from '../ports/history.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 
@@ -62,6 +63,7 @@ export class SettleOrderUseCase {
       orders: OrderRepository;
       orderItems: OrderItemRepository;
       refunds: RefundRepository;
+      orderEvents: OrderEventRepository;
       ledger: LedgerRepository;
       options: SettleOrderOptions;
       logger: Logger;
@@ -69,7 +71,7 @@ export class SettleOrderUseCase {
   ) {}
 
   async execute(orderId: string): Promise<SettleOrderResult> {
-    const { uow, orders, orderItems, refunds, ledger, logger, options } = this.deps;
+    const { uow, orders, orderItems, orderEvents, refunds, ledger, logger, options } = this.deps;
 
     const outcome = await uow.withTransaction(async (tx) => {
       const order = await orders.lockById(tx, orderId);
@@ -138,6 +140,18 @@ export class SettleOrderUseCase {
             currency: item.currency,
           }),
         );
+        await orderEvents.append(tx, [
+          {
+            orderId,
+            orderItemId: item.id,
+            type: 'item_refunded',
+            payload: {
+              sku: item.sku,
+              priceMinor: item.priceMinor,
+              reason: item.status === 'out_of_stock' ? 'out_of_stock' : 'delivery_failed',
+            },
+          },
+        ]);
       }
 
       // Re-read under the same lock: the statuses above changed, and the order's
@@ -167,6 +181,17 @@ export class SettleOrderUseCase {
           ['paid', 'delivering', 'out_of_stock', 'delivery_failed'],
           nextStatus,
         );
+        await orderEvents.append(tx, [
+          {
+            orderId,
+            type: 'order_settled',
+            payload: {
+              status: nextStatus,
+              deliveredMinor: settlement.deliveredMinor,
+              refundedMinor: settlement.refundableMinor,
+            },
+          },
+        ]);
       }
 
       return { order, settlement, nextStatus, refundsWritten: written.length };

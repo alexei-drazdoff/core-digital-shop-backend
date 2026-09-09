@@ -32,6 +32,7 @@ import type {
   ProductRepository,
   SupplierRequestRepository,
 } from '../ports/repositories.js';
+import type { OrderEventRepository } from '../ports/history.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 import type { DeliveryMetrics } from '../ports/metrics.js';
@@ -63,6 +64,7 @@ export class ReconcileSupplierRequestUseCase {
       deliveries: DeliveryRepository;
       supplierRequests: SupplierRequestRepository;
       issuedCodes: IssuedCodeRepository;
+      orderEvents: OrderEventRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
       rateLimiter: SupplierRateLimiter;
@@ -176,7 +178,7 @@ export class ReconcileSupplierRequestUseCase {
     requestId: string,
     code: string,
   ): Promise<ReconcileResult> {
-    const { uow, orderItems, products, deliveries, issuedCodes, ledger, metrics, logger } = this.deps;
+    const { uow, orderItems, products, deliveries, issuedCodes, orderEvents, ledger, metrics, logger } = this.deps;
 
     return uow.withTransaction(async (tx) => {
       const item = await orderItems.lockById(tx, orderItemId);
@@ -253,6 +255,14 @@ export class ReconcileSupplierRequestUseCase {
           requestId,
         }),
       );
+      await orderEvents.append(tx, [
+        {
+          orderId: item.orderId,
+          orderItemId,
+          type: 'item_delivered',
+          payload: { sku: item.sku, priceMinor: item.priceMinor, supplier, requestId, recovered: true },
+        },
+      ]);
       metrics.recordDelivery(supplier);
       logger.info(
         { order_item_id: orderItemId, supplier, request_id: requestId },

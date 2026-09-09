@@ -2,7 +2,8 @@ import { request as httpRequest } from 'undici';
 import type { AppServer } from '../types.js';
 import type { Container } from '../../../composition/container.js';
 import { deliveryJobDedupeKey } from '../../../application/use-cases/apply-payment-event.js';
-import { replenishBody } from '../schemas.js';
+import { asOfQuery, periodQuery, replenishBody } from '../schemas.js';
+import { projectOrderAt } from '../../../domain/order/projection.js';
 import { SUPPLIER_A } from '../../../shared/constants.js';
 
 export function registerAdminRoutes(app: AppServer, container: Container): void {
@@ -257,6 +258,104 @@ export function registerAdminRoutes(app: AppServer, container: Container): void 
     const synced = await useCases.syncStock.execute();
     const recovered = await useCases.recoverStuckOrders.execute();
     return { supplier: supplierName, sku: body.sku, added: body.count, synced, recovered };
+  });
+
+  /**
+   * The state of one order at a past moment, rebuilt from its history.
+   *
+   * Reconstructed by replaying the recorded facts, never by reading today's row
+   * and reasoning backwards: today's row says what is true now and has no memory
+   * of having been anything else.
+   *
+   * The fold keys off recorded_at — when we LEARNED a fact — rather than
+   * occurred_at. A webhook that arrived at 12:05 about a payment at 11:55 was
+   * not something we knew at 12:00, and answering otherwise would produce a
+   * history that retroactively knew the future.
+   */
+  app.get('/admin/orders/:id/at', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = asOfQuery.parse(request.query);
+    const asOf = new Date(query.ts);
+
+    const events = await repositories.orderEvents.findByOrder(pool, id);
+    if (events.length === 0) return reply.code(404).send({ error: 'order_not_found' });
+
+    const snapshot = projectOrderAt(id, events, asOf);
+
+    return {
+      order_id: snapshot.orderId,
+      as_of: snapshot.asOf.toISOString(),
+      // Null means the order did not exist yet at that moment, which is a real
+      // answer rather than a missing one.
+      status: snapshot.status,
+      amount: snapshot.amountMinor,
+      money: {
+        paid: snapshot.paidMinor,
+        delivered: snapshot.deliveredMinor,
+        refunded: snapshot.refundedMinor,
+        unresolved: snapshot.unresolvedMinor,
+      },
+      items: snapshot.items.map((item) => ({
+        order_item_id: item.orderItemId,
+        sku: item.sku,
+        price: item.priceMinor,
+        status: item.status,
+        supplier: item.supplier,
+        has_code: item.hasCode,
+      })),
+      events_applied: snapshot.eventsApplied,
+      events_total: events.length,
+    };
+  });
+
+  /** The full recorded history of one order. Append-only, so it only ever grows. */
+  app.get('/admin/orders/:id/history', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const events = await repositories.orderEvents.findByOrder(pool, id);
+    if (events.length === 0) return reply.code(404).send({ error: 'order_not_found' });
+
+    return {
+      order_id: id,
+      events: events.map((event) => ({
+        id: event.id,
+        type: event.type,
+        order_item_id: event.orderItemId,
+        payload: event.payload,
+        occurred_at: event.occurredAt.toISOString(),
+        recorded_at: event.recordedAt.toISOString(),
+      })),
+    };
+  });
+
+  /**
+   * Money moved in a period, out of the journal.
+   *
+   * The ledger is append-only and never back-dated, so re-running this for a
+   * closed period returns the same numbers forever. That permanence is the
+   * actual content of "итоги за период считаются из этой истории и сходятся" —
+   * not that the arithmetic works, but that it does not change.
+   *
+   * `balanced` is a genuine check rather than a restatement: cash held is summed
+   * from psp_cash while captured and refunded come from revenue and refund, so
+   * the two agreeing means three independent account sums tell one story.
+   */
+  app.get('/admin/reports/period', async (request, reply) => {
+    const query = periodQuery.parse(request.query);
+    const totals = await repositories.orderEvents.periodTotals(pool, new Date(query.from), new Date(query.to));
+
+    return reply.code(totals.balanced ? 200 : 409).send({
+      from: totals.from.toISOString(),
+      to: totals.to.toISOString(),
+      balanced: totals.balanced,
+      captured: totals.capturedMinor,
+      refunded: totals.refundedMinor,
+      net_revenue: totals.netRevenueMinor,
+      cash_movement: totals.cashMovementMinor,
+      orders_paid: totals.ordersPaid,
+      items_delivered: totals.itemsDelivered,
+      items_refunded: totals.itemsRefunded,
+      by_account: totals.byAccount,
+    });
   });
 
   /**

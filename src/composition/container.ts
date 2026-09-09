@@ -18,6 +18,7 @@ import { PgOrderItemRepository } from '../infrastructure/db/repositories/order-i
 import { PgPaymentEventRepository } from '../infrastructure/db/repositories/payment-event-repository.js';
 import { PgDeliveryRepository, PgSupplierRequestRepository } from '../infrastructure/db/repositories/delivery-repository.js';
 import { PgIssuedCodeRepository } from '../infrastructure/db/repositories/issued-code-repository.js';
+import { PgOrderEventRepository } from '../infrastructure/db/repositories/order-event-repository.js';
 import { PgRefundRepository } from '../infrastructure/db/repositories/refund-repository.js';
 import { PgLedgerRepository } from '../infrastructure/db/repositories/ledger-repository.js';
 import { PgIdempotencyRepository } from '../infrastructure/db/repositories/idempotency-repository.js';
@@ -51,6 +52,7 @@ export interface Container {
     products: PgProductRepository;
     orders: PgOrderRepository;
     orderItems: PgOrderItemRepository;
+    orderEvents: PgOrderEventRepository;
     paymentEvents: PgPaymentEventRepository;
     deliveries: PgDeliveryRepository;
     supplierRequests: PgSupplierRequestRepository;
@@ -94,6 +96,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
   const products = new PgProductRepository();
   const orders = new PgOrderRepository();
   const orderItems = new PgOrderItemRepository();
+  const orderEvents = new PgOrderEventRepository();
   const paymentEvents = new PgPaymentEventRepository();
   const deliveries = new PgDeliveryRepository();
   const supplierRequests = new PgSupplierRequestRepository();
@@ -130,6 +133,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     uow,
     orders,
     orderItems,
+    orderEvents,
     paymentEvents,
     ledger,
     queue,
@@ -141,6 +145,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     products,
     orders,
     orderItems,
+    orderEvents,
     paymentEvents,
     idempotency,
     applyPaymentEvent,
@@ -156,6 +161,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     deliveries,
     supplierRequests,
     issuedCodes,
+    orderEvents,
     ledger,
     queue,
     rateLimiter,
@@ -175,6 +181,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     orders,
     orderItems,
     refunds,
+    orderEvents,
     ledger,
     logger,
     options: { maxDeliveryRounds: config.ITEM_MAX_DELIVERY_ROUNDS },
@@ -187,6 +194,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     deliveries,
     supplierRequests,
     issuedCodes,
+    orderEvents,
     ledger,
     queue,
     rateLimiter,
@@ -230,6 +238,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
       products,
       orders,
       orderItems,
+      orderEvents,
       paymentEvents,
       deliveries,
       supplierRequests,

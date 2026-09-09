@@ -68,6 +68,28 @@ export const storefrontQuery = z.object({
     .optional(),
 });
 
+/** ?ts=<ISO 8601>. Required: "state at some unspecified moment" is not a question. */
+export const asOfQuery = z.object({
+  ts: z.string().datetime({ offset: true }),
+});
+
+/**
+ * A half open period [from, to).
+ *
+ * Half open so consecutive periods tile without overlapping: the last
+ * millisecond of March must not also be the first of April, or the two monthly
+ * reports would double count it and their sum would exceed the year.
+ */
+export const periodQuery = z
+  .object({
+    from: z.string().datetime({ offset: true }),
+    to: z.string().datetime({ offset: true }),
+  })
+  .refine((value) => new Date(value.from) < new Date(value.to), {
+    message: '"from" must be earlier than "to"',
+    path: ['to'],
+  });
+
 export const replenishBody = z.object({
   sku: z.string().min(1),
   supplier: z.string().min(1).optional(),

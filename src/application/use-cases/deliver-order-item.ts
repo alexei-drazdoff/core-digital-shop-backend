@@ -47,6 +47,7 @@ import type {
   ProductRepository,
   SupplierRequestRepository,
 } from '../ports/repositories.js';
+import type { OrderEventRepository } from '../ports/history.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 import type { DeliveryMetrics } from '../ports/metrics.js';
@@ -107,6 +108,7 @@ export class DeliverOrderItemUseCase {
       deliveries: DeliveryRepository;
       supplierRequests: SupplierRequestRepository;
       issuedCodes: IssuedCodeRepository;
+      orderEvents: OrderEventRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
       rateLimiter: SupplierRateLimiter;
@@ -500,6 +502,16 @@ export class DeliverOrderItemUseCase {
           reason: rejection,
         }),
       );
+      await uow.withTransaction((tx) =>
+        this.deps.orderEvents.append(tx, [
+          {
+            orderId: context.orderId,
+            orderItemId: context.orderItemId,
+            type: 'code_quarantined',
+            payload: { supplier: context.supplier, requestId: context.requestId, reason: rejection },
+          },
+        ]),
+      );
     }
 
     logger.error(
@@ -528,7 +540,7 @@ export class DeliverOrderItemUseCase {
     winner: SupplierOutcome,
     outcomes: readonly SupplierOutcome[],
   ): Promise<DeliverOrderItemResult> {
-    const { uow, orderItems, products, deliveries, issuedCodes, ledger, metrics, logger } = this.deps;
+    const { uow, orderItems, products, deliveries, issuedCodes, orderEvents, ledger, metrics, logger } = this.deps;
     const code = winner.code;
     if (!code) throw new Error('finalise called without a code');
 
@@ -586,6 +598,21 @@ export class DeliverOrderItemUseCase {
 
       await orderItems.transition(tx, orderItemId, 'delivering', 'delivered');
       await products.adjustStock(tx, item.productId, -1);
+      // Appended in the same transaction as the delivery it describes, so the
+      // history cannot drift from the rows it explains.
+      await orderEvents.append(tx, [
+        {
+          orderId: item.orderId,
+          orderItemId,
+          type: 'item_delivered',
+          payload: {
+            sku: item.sku,
+            priceMinor: item.priceMinor,
+            supplier: winner.supplier,
+            requestId: winner.requestId,
+          },
+        },
+      ]);
       await ledger.append(
         tx,
         deliveryCostEntries({
