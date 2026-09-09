@@ -28,6 +28,24 @@ export class OrderNotFoundError extends DomainError {
   }
 }
 
+/**
+ * A basket priced in more than one currency.
+ *
+ * The payment contract carries one amount and one currency, so a mixed basket
+ * has no single number to check a payment against. Refused at creation rather
+ * than converted, because inventing an exchange rate to make a check pass is how
+ * a money bug gets built.
+ */
+export class MixedCurrencyBasketError extends DomainError {
+  constructor(expected: string, received: string) {
+    super(
+      `basket mixes currencies: ${expected} and ${received}`,
+      'mixed_currency_basket',
+      422,
+    );
+  }
+}
+
 /** Same Idempotency-Key replayed with a different body: the two cannot both be honoured. */
 export class IdempotencyConflictError extends DomainError {
   constructor(key: string) {

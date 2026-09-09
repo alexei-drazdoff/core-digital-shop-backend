@@ -1,13 +1,11 @@
 import type { Executor } from '../pool.js';
 import type { TransactionScope } from '../unit-of-work.js';
-import type { Order } from '../../../domain/order/order.js';
+import type { Order, OrderItem } from '../../../domain/order/order.js';
 import type { OrderStatus } from '../../../domain/order/status.js';
 import type { OrderRepository } from '../../../application/ports/repositories.js';
 
 interface OrderRow {
   id: string;
-  product_id: number;
-  sku: string;
   amount_minor: number;
   currency: string;
   customer_ref: string | null;
@@ -18,14 +16,12 @@ interface OrderRow {
   delivered_at: Date | null;
 }
 
-const COLUMNS = `id, product_id, sku, amount_minor, currency, customer_ref, status,
+const COLUMNS = `id, amount_minor, currency, customer_ref, status,
                  created_at, updated_at, paid_at, delivered_at`;
 
 function toOrder(row: OrderRow): Order {
   return {
     id: row.id,
-    productId: row.product_id,
-    sku: row.sku,
     amountMinor: row.amount_minor,
     currency: row.currency,
     customerRef: row.customer_ref,
@@ -38,11 +34,40 @@ function toOrder(row: OrderRow): Order {
 }
 
 export class PgOrderRepository implements OrderRepository {
-  async insert(tx: TransactionScope, order: Order): Promise<void> {
+  /**
+   * Writes the basket as one fact.
+   *
+   * The lines go in with a single multi-row INSERT rather than a loop: an order
+   * with no lines, or with only some of them, is not a lesser order but a
+   * corrupt one, and the total in `orders.amount_minor` would already be lying
+   * about what the customer is being charged for.
+   */
+  async insert(tx: TransactionScope, order: Order, items: readonly OrderItem[]): Promise<void> {
     await tx.query(
-      `INSERT INTO orders (id, product_id, sku, amount_minor, currency, customer_ref, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [order.id, order.productId, order.sku, order.amountMinor, order.currency, order.customerRef, order.status],
+      `INSERT INTO orders (id, amount_minor, currency, customer_ref, status)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [order.id, order.amountMinor, order.currency, order.customerRef, order.status],
+    );
+
+    if (items.length === 0) return;
+
+    await tx.query(
+      `INSERT INTO order_items (id, order_id, line_no, product_id, sku, price_minor, cost_minor, currency, status)
+       SELECT * FROM unnest(
+         $1::text[], $2::text[], $3::int[], $4::bigint[], $5::text[],
+         $6::bigint[], $7::bigint[], $8::bpchar[], $9::text[]
+       )`,
+      [
+        items.map((item) => item.id),
+        items.map((item) => item.orderId),
+        items.map((item) => item.lineNo),
+        items.map((item) => item.productId),
+        items.map((item) => item.sku),
+        items.map((item) => item.priceMinor),
+        items.map((item) => item.costMinor),
+        items.map((item) => item.currency),
+        items.map((item) => item.status),
+      ],
     );
   }
 
@@ -85,7 +110,11 @@ export class PgOrderRepository implements OrderRepository {
           SET status = $3,
               updated_at = now(),
               paid_at = CASE WHEN $3 = 'paid' AND paid_at IS NULL THEN now() ELSE paid_at END,
-              delivered_at = CASE WHEN $3 = 'delivered' AND delivered_at IS NULL THEN now() ELSE delivered_at END
+              -- Set on any outcome where at least one line reached the customer,
+              -- so "when did this order finish" has an answer for a partially
+              -- delivered basket too.
+              delivered_at = CASE WHEN $3 IN ('delivered', 'partially_delivered') AND delivered_at IS NULL
+                                  THEN now() ELSE delivered_at END
         WHERE id = $1 AND status = ANY($2::text[])`,
       [orderId, expected, to],
     );

@@ -1,27 +1,34 @@
 /**
- * Drives orders that stopped moving back into delivery.
+ * Drives work that stopped moving back into flight.
  *
  * Three failure shapes end up here and all of them are safe to retry, because
  * the retry goes through the same delivery path with the same derived request
- * ids and the same unique constraint underneath.
+ * ids and the same unique constraints underneath.
  *
- *   paid or delivering past the deadline: a worker died, or a job was lost.
+ *   pending or delivering past the deadline: a worker died, or a job was lost.
  *   out_of_stock: the goods were missing, and stock may be back.
  *   delivery_failed: the suppliers were unwell, and may have recovered.
  *
- * The sweep only enqueues. It never calls a supplier itself, so a slow supplier
- * cannot stall the scan, and the live-job dedupe index means a second sweep
- * cannot pile duplicate work onto an order that is already being retried.
+ * The sweep works at the level of LINES, not orders. A basket where two lines
+ * are delivered and one is stuck is not a stuck order by any status you could
+ * read off the order row, and sweeping orders would leave that third line
+ * unfetched forever while the report cheerfully said the order was in progress.
+ *
+ * It only enqueues. It never calls a supplier itself, so a slow supplier cannot
+ * stall the scan, and the live-job dedupe index means a second sweep cannot pile
+ * duplicate work onto a line that is already being retried.
  */
-import { deliveryJobDedupeKey } from './apply-payment-event.js';
+import { deliveryJobDedupeKey, settlementJobDedupeKey } from './apply-payment-event.js';
 import type { JobQueue } from '../ports/queue.js';
-import type { OrderRepository, PaymentEventRepository } from '../ports/repositories.js';
+import type { OrderItemRepository, OrderRepository, PaymentEventRepository } from '../ports/repositories.js';
 import type { Clock } from '../ports/clock.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
 import type { Logger } from '../../infrastructure/observability/logger.js';
 
 export interface RecoveryReport {
-  readonly ordersRequeued: number;
+  readonly itemsReleased: number;
+  readonly itemsRequeued: number;
+  readonly ordersResettled: number;
   readonly deferredEventsRequeued: number;
   readonly abandonedJobsRequeued: number;
 }
@@ -31,17 +38,20 @@ export class RecoverStuckOrdersUseCase {
     private readonly deps: {
       uow: UnitOfWork;
       orders: OrderRepository;
+      orderItems: OrderItemRepository;
       paymentEvents: PaymentEventRepository;
       queue: JobQueue;
       clock: Clock;
       logger: Logger;
       stuckAfterMs: number;
+      /** Mirrors SettleOrderOptions: a line past its budget is settlement's problem. */
+      maxDeliveryRounds: number;
       batchSize?: number;
     },
   ) {}
 
   async execute(): Promise<RecoveryReport> {
-    const { uow, orders, paymentEvents, queue, clock, logger } = this.deps;
+    const { uow, orders, orderItems, paymentEvents, queue, clock, logger } = this.deps;
     const batchSize = this.deps.batchSize ?? 100;
     const deadline = new Date(clock.now().getTime() - this.deps.stuckAfterMs);
 
@@ -49,20 +59,58 @@ export class RecoverStuckOrdersUseCase {
     // first. Otherwise the enqueues below would be deduplicated against ghosts.
     const abandonedJobsRequeued = await queue.requeueAbandoned(uow.executor, deadline);
 
-    const stuck = await orders.findStuck(uow.executor, deadline, batchSize);
-    let ordersRequeued = 0;
-    for (const order of stuck) {
+    // The same problem one level down. A line left in `delivering` by a dead
+    // worker cannot be claimed by a new one, because the claim refuses to take a
+    // line somebody is supposedly already working on. Released before the scan,
+    // so the very sweep that notices the abandonment also picks the line up.
+    const itemsReleased = await uow.withTransaction((tx) =>
+      orderItems.releaseStaleDelivering(tx, deadline, batchSize),
+    );
+    if (itemsReleased > 0) {
+      logger.warn({ itemsReleased }, 'order lines released from delivering after their worker disappeared');
+    }
+
+    const stuckItems = await orderItems.findStuck(uow.executor, deadline, batchSize, this.deps.maxDeliveryRounds);
+    const touchedOrders = new Set<string>();
+    let itemsRequeued = 0;
+
+    for (const item of stuckItems) {
+      touchedOrders.add(item.orderId);
       const enqueued = await uow.withTransaction((tx) =>
         queue.enqueue(tx, {
-          kind: 'deliver_order',
-          dedupeKey: deliveryJobDedupeKey(order.id),
-          payload: { orderId: order.id },
+          kind: 'deliver_order_item',
+          dedupeKey: deliveryJobDedupeKey(item.id),
+          payload: { orderItemId: item.id },
         }),
       );
       if (enqueued) {
-        ordersRequeued += 1;
-        logger.warn({ order_id: order.id, status: order.status }, 'stuck order requeued for delivery');
+        itemsRequeued += 1;
+        logger.warn(
+          { order_id: item.orderId, order_item_id: item.id, status: item.status, rounds: item.rounds },
+          'stuck order line requeued for delivery',
+        );
       }
+    }
+
+    // Orders whose lines are all resolved but whose own status never caught up,
+    // because the process died between the last delivery and its settlement.
+    // Settlement is cheap and idempotent, so asking again costs a query and
+    // closes the only hole that would otherwise leave a fully delivered basket
+    // sitting in `delivering`.
+    for (const order of await orders.findStuck(uow.executor, deadline, batchSize)) {
+      touchedOrders.add(order.id);
+    }
+
+    let ordersResettled = 0;
+    for (const orderId of touchedOrders) {
+      const enqueued = await uow.withTransaction((tx) =>
+        queue.enqueue(tx, {
+          kind: 'settle_order',
+          dedupeKey: settlementJobDedupeKey(orderId),
+          payload: { orderId },
+        }),
+      );
+      if (enqueued) ordersResettled += 1;
     }
 
     // Events parked before their order existed. Their order may have shown up since.
@@ -81,9 +129,12 @@ export class RecoverStuckOrdersUseCase {
       if (enqueued) deferredEventsRequeued += 1;
     }
 
-    if (ordersRequeued > 0 || deferredEventsRequeued > 0 || abandonedJobsRequeued > 0) {
-      logger.info({ ordersRequeued, deferredEventsRequeued, abandonedJobsRequeued }, 'recovery sweep completed');
+    if (itemsRequeued > 0 || ordersResettled > 0 || deferredEventsRequeued > 0 || abandonedJobsRequeued > 0) {
+      logger.info(
+        { itemsReleased, itemsRequeued, ordersResettled, deferredEventsRequeued, abandonedJobsRequeued },
+        'recovery sweep completed',
+      );
     }
-    return { ordersRequeued, deferredEventsRequeued, abandonedJobsRequeued };
+    return { itemsReleased, itemsRequeued, ordersResettled, deferredEventsRequeued, abandonedJobsRequeued };
   }
 }

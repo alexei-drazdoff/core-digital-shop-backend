@@ -51,7 +51,9 @@ describe('criterion 4: a timeout is not a refusal', () => {
       [orderId],
     );
 
-    const expectedRequestId = supplierRequestId(orderId, SUPPLIER_A);
+    // Epoch 1: nothing about a timeout invalidates the ANSWER, so the request
+    // id stays the same one and the retry re-asks about that call.
+    const expectedRequestId = supplierRequestId(await harness.singleItemId(orderId), SUPPLIER_A, 1);
     const attemptsAtA = attempts.rows.filter((row) => row.supplier === SUPPLIER_A);
 
     assert.ok(attemptsAtA.length >= 2, 'supplier A must have been retried after the timeout');

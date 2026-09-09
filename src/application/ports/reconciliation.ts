@@ -17,10 +17,20 @@ export interface ReconciliationRow {
 
 export interface ReconciliationReport {
   readonly generatedAt: Date;
-  /** Money taken, goods not handed over. The one that costs customer trust. */
+  /** Paid lines with neither a code nor a refund. The one that costs customer trust. */
   readonly paidNotDelivered: readonly ReconciliationRow[];
   /** Goods handed over, no confirmed payment behind them. The one that costs money. */
   readonly deliveredNotPaid: readonly ReconciliationRow[];
+  /**
+   * Lines that are both delivered and refunded.
+   *
+   * The failure that breaks "оплачено = выдано + возвращено" while every account
+   * still balances, because the delivery and the refund are each a correct double
+   * entry on their own. Must always be empty.
+   */
+  readonly doubleSettledItems: readonly ReconciliationRow[];
+  /** Orders whose lines are all resolved but whose own status never caught up. */
+  readonly unsettledOrders: readonly ReconciliationRow[];
   /** Supplier calls whose outcome is still unknown, so stock may be silently consumed. */
   readonly unresolvedSupplierRequests: readonly ReconciliationRow[];
   /** Stock consumed with no sale behind it, already written off as shrinkage. */

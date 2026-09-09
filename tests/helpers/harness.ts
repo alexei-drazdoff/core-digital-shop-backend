@@ -36,8 +36,19 @@ export interface Harness {
   /** Runs queued jobs until the queue is empty or `maxTicks` is reached. */
   drain(maxTicks?: number): Promise<void>;
   chaos(supplier: string, patch: Record<string, unknown>): Promise<void>;
-  issuanceCount(supplier: string, orderId: string): Promise<number>;
-  createOrder(sku: string, options?: { orderId?: string; idempotencyKey?: string }): Promise<{ orderId: string; amount: number }>;
+  /** Codes the supplier issued against an order or one of its lines. */
+  issuanceCount(supplier: string, orderOrItemId: string): Promise<number>;
+  createOrder(
+    sku: string,
+    options?: { orderId?: string; idempotencyKey?: string },
+  ): Promise<{ orderId: string; amount: number; itemIds: string[] }>;
+  /** A basket. Each entry becomes one line, so repeats mean repeated lines. */
+  createBasket(
+    skus: readonly string[],
+    options?: { orderId?: string; idempotencyKey?: string },
+  ): Promise<{ orderId: string; amount: number; itemIds: string[] }>;
+  /** The single line of a one product order. Fails loudly on a basket. */
+  singleItemId(orderId: string): Promise<string>;
   getOrder(orderId: string): Promise<Record<string, unknown>>;
   stop(): Promise<void>;
 }
@@ -56,7 +67,9 @@ export async function startHarness(overrides: Partial<NodeJS.ProcessEnv> = {}): 
   // own, which matters more here than the second it costs to migrate.
   const { databaseUrl } = await createScratchDatabase(rootUrl);
 
-  const bootstrapPool = createPool(loadConfig({ ...process.env, DATABASE_URL: databaseUrl }));
+  const bootstrapPool = createPool(
+    loadConfig({ ...process.env, DATABASE_URL: databaseUrl, DATABASE_POOL_MAX: '2' }),
+  );
   await migrateUp(bootstrapPool);
   await seedDatabase(bootstrapPool);
   await bootstrapPool.end();
@@ -70,14 +83,25 @@ export async function startHarness(overrides: Partial<NodeJS.ProcessEnv> = {}): 
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
     DATABASE_URL: databaseUrl,
+    // The server's max_connections is shared by every test file running in
+    // parallel, and the production default of 20 per pool would exhaust it.
+    // Sized against the runner's file concurrency in scripts/run-tests.ts, and
+    // not lower: a starved pool makes the supplier stub answer slowly, which the
+    // delivery path correctly reads as a timeout, and scenarios that mean to
+    // test a clean refusal would quietly start testing the timeout path instead.
+    DATABASE_POOL_MAX: '16',
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
     ADMIN_TOKEN: 'test-admin-token',
     SUPPLIER_A_URL: 'http://127.0.0.1:1',
     SUPPLIER_B_URL: 'http://127.0.0.1:1',
     // Short and deterministic: the tests script the failures, so there is no
-    // reason to wait out production timeouts.
-    SUPPLIER_TIMEOUT_MS: '400',
+    // reason to wait out production timeouts. Not TOO short, though — the stubs
+    // share a database with the system under test, and a timeout tight enough to
+    // trip on ordinary contention would turn an intended refusal into an
+    // indeterminate outcome. Every scripted hang is 30s, so this has enormous
+    // headroom and still fails fast.
+    SUPPLIER_TIMEOUT_MS: '1500',
     SUPPLIER_MAX_ATTEMPTS: '3',
     SUPPLIER_BACKOFF_BASE_MS: '10',
     SUPPLIER_BACKOFF_MAX_MS: '30',
@@ -89,7 +113,9 @@ export async function startHarness(overrides: Partial<NodeJS.ProcessEnv> = {}): 
   };
   loadConfig(baseEnv);
 
-  const stubPool = createPool(loadConfig({ ...process.env, DATABASE_URL: databaseUrl }));
+  const stubPool = createPool(
+    loadConfig({ ...process.env, DATABASE_URL: databaseUrl, DATABASE_POOL_MAX: '8' }),
+  );
   const stubs = await Promise.all(
     [SUPPLIER_A, SUPPLIER_B].map(async (supplier) => {
       const app = createSupplierStub({ pool: stubPool, supplier, logLevel: 'silent' });
@@ -155,15 +181,41 @@ export async function startHarness(overrides: Partial<NodeJS.ProcessEnv> = {}): 
     },
 
     async createOrder(sku, options = {}) {
+      return harness.createBasket([sku], options);
+    },
+
+    async createBasket(skus, options = {}) {
       const response = await api.inject({
         method: 'POST',
         url: '/orders',
         headers: options.idempotencyKey ? { 'idempotency-key': options.idempotencyKey } : {},
-        payload: { sku, ...(options.orderId ? { order_id: options.orderId } : {}) },
+        payload: {
+          items: skus.map((sku) => ({ sku })),
+          ...(options.orderId ? { order_id: options.orderId } : {}),
+        },
       });
       if (response.statusCode >= 400) throw new Error(`order creation failed: ${response.body}`);
-      const body = response.json() as { order_id: string; amount: number };
-      return { orderId: body.order_id, amount: body.amount };
+      const body = response.json() as {
+        order_id: string;
+        amount: number;
+        items: Array<{ order_item_id: string }>;
+      };
+      return {
+        orderId: body.order_id,
+        amount: body.amount,
+        itemIds: body.items.map((item) => item.order_item_id),
+      };
+    },
+
+    async singleItemId(orderId) {
+      const result = await container.pool.query<{ id: string }>(
+        'SELECT id FROM order_items WHERE order_id = $1 ORDER BY line_no',
+        [orderId],
+      );
+      if (result.rows.length !== 1) {
+        throw new Error(`expected one line for ${orderId}, found ${result.rows.length}`);
+      }
+      return result.rows[0]!.id;
     },
 
     async getOrder(orderId) {
@@ -195,7 +247,20 @@ async function createScratchDatabase(rootUrl: string): Promise<ScratchDatabase> 
   const admin = new URL(rootUrl);
   admin.pathname = '/postgres';
 
-  const adminPool = createPool(loadConfig({ ...process.env, DATABASE_URL: admin.toString() }));
+  // CREATE DATABASE serialises on the server, so when every test file starts at
+  // once the last one in the queue waits for all the others. That wait is not a
+  // stuck query and must not be cut short by the application's statement
+  // timeout, which exists to stop one slow SELECT pinning a connection while
+  // webhooks queue behind it. Overridden here rather than raised globally: the
+  // short timeout is correct for the application and wrong only for this DDL.
+  const adminPool = createPool(
+    loadConfig({
+      ...process.env,
+      DATABASE_URL: admin.toString(),
+      DATABASE_STATEMENT_TIMEOUT_MS: '120000',
+      DATABASE_POOL_MAX: '2',
+    }),
+  );
   try {
     // The name is generated here, never taken from input, so interpolating it
     // into DDL (which cannot be parameterised) is safe.
@@ -219,7 +284,9 @@ async function createScratchDatabase(rootUrl: string): Promise<ScratchDatabase> 
 export async function dropStaleScratchDatabases(rootUrl: string): Promise<number> {
   const admin = new URL(rootUrl);
   admin.pathname = '/postgres';
-  const adminPool = createPool(loadConfig({ ...process.env, DATABASE_URL: admin.toString() }));
+  const adminPool = createPool(
+    loadConfig({ ...process.env, DATABASE_URL: admin.toString(), DATABASE_STATEMENT_TIMEOUT_MS: '120000' }),
+  );
   let dropped = 0;
   try {
     const stale = await adminPool.query<{ datname: string }>(

@@ -36,7 +36,21 @@ if (!rootUrl) {
 const dropped = await dropStaleScratchDatabases(rootUrl);
 if (dropped > 0) console.log(`removed ${dropped} scratch database(s) from a previous run`);
 
-const child = spawn(process.execPath, ['--import', 'tsx', '--test', ...patterns], {
+// Bounded file concurrency.
+//
+// Every file creates its own database, its own application pool and a pool for
+// the two supplier stubs, and they all land on one server whose max_connections
+// is typically 100. Unbounded, the runner starts every file at once and two
+// things go wrong: CREATE DATABASE serialises, so the last file waits out all
+// the others, and the pools together ask for more connections than exist. A
+// starved pool is the nastier of the two, because it makes the stubs answer
+// slowly and the delivery path correctly reads that as a timeout, quietly
+// turning a test about a clean refusal into a test about the timeout path.
+//
+// Three files times roughly 24 connections leaves comfortable headroom.
+const concurrency = process.env.TEST_CONCURRENCY ?? '3';
+
+const child = spawn(process.execPath, ['--import', 'tsx', '--test', `--test-concurrency=${concurrency}`, ...patterns], {
   stdio: 'inherit',
   env: process.env,
 });

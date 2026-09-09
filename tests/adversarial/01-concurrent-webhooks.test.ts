@@ -62,10 +62,11 @@ describe('criterion 1: 50 concurrent webhooks produce exactly one delivery', () 
     );
     assert.equal(events.rows[0]?.count, 50, 'all 50 events must be persisted for the audit trail');
 
-    // The outbox produced exactly one unit of delivery work.
+    // The outbox produced exactly one unit of delivery work. Delivery is keyed
+    // on the LINE now, so the dedupe key is the line's.
     const jobs = await harness.pool.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM jobs WHERE dedupe_key = $1',
-      [`deliver:${orderId}`],
+      [`deliver:${await harness.singleItemId(orderId)}`],
     );
     assert.equal(jobs.rows[0]?.count, 1, 'exactly one delivery job');
 

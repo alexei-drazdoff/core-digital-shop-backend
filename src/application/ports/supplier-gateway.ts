@@ -19,10 +19,18 @@ export type SupplierResult =
       readonly latencyMs: number;
     };
 
+export interface SupplierIssueRequest {
+  readonly requestId: string;
+  readonly orderId: string;
+  /** The line being fetched. One code, one line, one request id. */
+  readonly orderItemId: string;
+  readonly sku: string;
+}
+
 export interface SupplierGateway {
   readonly name: string;
   /** Calls POST /issue once. Retry policy belongs to the caller, not here. */
-  issue(input: { requestId: string; orderId: string; sku: string }): Promise<SupplierResult>;
+  issue(input: SupplierIssueRequest): Promise<SupplierResult>;
   /** Current per SKU availability, used by the stock sync job. */
   stock(): Promise<ReadonlyArray<{ sku: string; available: number }>>;
 }

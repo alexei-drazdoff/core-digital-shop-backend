@@ -1,7 +1,14 @@
 import type { Executor } from '../../infrastructure/db/pool.js';
 import type { TransactionScope } from '../../infrastructure/db/unit-of-work.js';
 
-export const JOB_KINDS = ['deliver_order', 'reconcile_supplier_request', 'apply_deferred_event'] as const;
+export const JOB_KINDS = [
+  /** Fetch a code for one line of a paid basket. */
+  'deliver_order_item',
+  /** Decide the fate of a basket once its lines stop moving: refunds and final status. */
+  'settle_order',
+  'reconcile_supplier_request',
+  'apply_deferred_event',
+] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export interface Job {

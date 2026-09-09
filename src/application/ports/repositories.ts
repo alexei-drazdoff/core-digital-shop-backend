@@ -5,8 +5,8 @@
  */
 import type { Executor } from '../../infrastructure/db/pool.js';
 import type { TransactionScope } from '../../infrastructure/db/unit-of-work.js';
-import type { Order } from '../../domain/order/order.js';
-import type { OrderStatus } from '../../domain/order/status.js';
+import type { Order, OrderItem } from '../../domain/order/order.js';
+import type { OrderItemStatus, OrderStatus } from '../../domain/order/status.js';
 import type { LedgerEntry } from '../../domain/ledger/entries.js';
 
 export interface Product {
@@ -50,7 +50,8 @@ export interface ProductRepository {
 }
 
 export interface OrderRepository {
-  insert(tx: TransactionScope, order: Order): Promise<void>;
+  /** Writes the order and all of its lines in one statement pair, inside the caller's transaction. */
+  insert(tx: TransactionScope, order: Order, items: readonly OrderItem[]): Promise<void>;
   findById(exec: Executor, orderId: string): Promise<Order | null>;
   /** SELECT ... FOR UPDATE. Serialises concurrent handlers of the same order. */
   lockById(tx: TransactionScope, orderId: string): Promise<Order | null>;
@@ -68,6 +69,57 @@ export interface OrderRepository {
     to: OrderStatus,
   ): Promise<boolean>;
   findStuck(exec: Executor, olderThan: Date, limit: number): Promise<readonly Order[]>;
+}
+
+/**
+ * The lines of a basket.
+ *
+ * Separate from OrderRepository because the two answer different questions and
+ * are locked at different granularities: the order row is what serialises money,
+ * the line row is what serialises one supplier conversation. A worker delivering
+ * line 3 must not queue behind a worker delivering line 1.
+ */
+export interface OrderItemRepository {
+  findByOrder(exec: Executor, orderId: string): Promise<readonly OrderItem[]>;
+  findById(exec: Executor, orderItemId: string): Promise<OrderItem | null>;
+  /** SELECT ... FOR UPDATE on the single line. */
+  lockById(tx: TransactionScope, orderItemId: string): Promise<OrderItem | null>;
+  /**
+   * SELECT ... FOR UPDATE over every line of an order, in a fixed order.
+   *
+   * Settlement needs all of them at once to decide the order's fate, and taking
+   * them by line_no means two concurrent settlements of the same order acquire
+   * the same locks in the same sequence and cannot deadlock.
+   */
+  lockByOrder(tx: TransactionScope, orderId: string): Promise<readonly OrderItem[]>;
+  /**
+   * Conditional UPDATE guarded on the expected current status, mirroring
+   * OrderRepository.transition. The database picks the winner.
+   */
+  transition(
+    tx: TransactionScope,
+    orderItemId: string,
+    from: OrderItemStatus | readonly OrderItemStatus[],
+    to: OrderItemStatus,
+  ): Promise<boolean>;
+  /** Records that one more full pass through the suppliers has been spent. */
+  countRound(tx: TransactionScope, orderItemId: string): Promise<number>;
+  /**
+   * Returns lines abandoned in `delivering` to a claimable state.
+   *
+   * The line-level counterpart of JobQueue.requeueAbandoned. Without it a worker
+   * that dies mid delivery leaves a line nothing can claim and nothing will
+   * refund, which is a paid customer stranded forever.
+   */
+  releaseStaleDelivering(tx: TransactionScope, olderThan: Date, limit: number): Promise<number>;
+  /**
+   * Lines of paid orders that stopped moving and still have attempts left.
+   *
+   * Feeds the recovery sweep. `maxRounds` is passed rather than assumed so the
+   * sweep never re-enqueues a line whose budget is spent: the only correct
+   * action for those is a refund, and settlement owns that.
+   */
+  findStuck(exec: Executor, olderThan: Date, limit: number, maxRounds: number): Promise<readonly OrderItem[]>;
 }
 
 export interface IncomingPaymentEvent {
@@ -121,7 +173,10 @@ export type SupplierRequestState = 'in_flight' | 'succeeded' | 'failed_definitiv
 export interface SupplierRequestRecord {
   readonly requestId: string;
   readonly orderId: string;
+  readonly orderItemId: string;
   readonly supplier: string;
+  /** Advances only when a response is rejected as invalid. See supplierRequestId. */
+  readonly epoch: number;
   readonly state: SupplierRequestState;
   readonly code: string | null;
   readonly failureReason: string | null;
@@ -131,7 +186,10 @@ export interface SupplierRequestRecord {
 
 export interface SupplierRequestRepository {
   /** Records the intent to call a supplier BEFORE the call is made. */
-  beginAttempt(exec: Executor, requestId: string, orderId: string, supplier: string): Promise<SupplierRequestRecord>;
+  beginAttempt(
+    exec: Executor,
+    request: { requestId: string; orderId: string; orderItemId: string; supplier: string; epoch: number },
+  ): Promise<SupplierRequestRecord>;
   settle(
     exec: Executor,
     requestId: string,
@@ -140,12 +198,21 @@ export interface SupplierRequestRepository {
   ): Promise<void>;
   find(exec: Executor, requestId: string): Promise<SupplierRequestRecord | null>;
   findByOrder(exec: Executor, orderId: string): Promise<readonly SupplierRequestRecord[]>;
+  /**
+   * The highest epoch reached for (line, supplier), or 0 when nothing was ever sent.
+   *
+   * Delivery resumes at this epoch rather than restarting at 1, which is what
+   * keeps a retry after a crash asking about the request that may already have
+   * produced a code instead of opening a fresh one.
+   */
+  latestEpoch(exec: Executor, orderItemId: string, supplier: string): Promise<number>;
   /** Indeterminate calls the background reconciler still has to settle. */
   findUnsettled(exec: Executor, olderThan: Date, limit: number): Promise<readonly SupplierRequestRecord[]>;
   recordAttempt(
     exec: Executor,
     attempt: {
       orderId: string;
+      orderItemId: string;
       supplier: string;
       requestId: string;
       attemptNo: number;
@@ -158,6 +225,7 @@ export interface SupplierRequestRepository {
 
 export interface DeliveryRecord {
   readonly orderId: string;
+  readonly orderItemId: string;
   readonly supplier: string;
   readonly requestId: string;
   readonly code: string;
@@ -166,18 +234,48 @@ export interface DeliveryRecord {
 
 export interface DeliveryRepository {
   /**
-   * INSERT ... ON CONFLICT (order_id) DO NOTHING.
+   * INSERT ... ON CONFLICT (order_item_id) DO NOTHING.
    *
-   * The third and final exactly-once layer. A false return means this order was
+   * The third and final exactly-once layer. A false return means this line was
    * already delivered, and the caller must treat its own code as surplus rather
    * than overwrite anything.
    */
   recordIfAbsent(tx: TransactionScope, delivery: Omit<DeliveryRecord, 'deliveredAt'>): Promise<boolean>;
-  findByOrder(exec: Executor, orderId: string): Promise<DeliveryRecord | null>;
+  findByItem(exec: Executor, orderItemId: string): Promise<DeliveryRecord | null>;
+  findByOrder(exec: Executor, orderId: string): Promise<readonly DeliveryRecord[]>;
   recordOrphan(
     tx: TransactionScope,
-    orphan: { orderId: string; supplier: string; requestId: string; code: string; note: string },
+    orphan: {
+      orderId: string;
+      orderItemId: string;
+      supplier: string;
+      requestId: string;
+      code: string;
+      note: string;
+    },
   ): Promise<boolean>;
+}
+
+export interface RefundRecord {
+  readonly orderId: string;
+  readonly orderItemId: string;
+  readonly amountMinor: number;
+  readonly currency: string;
+  readonly reason: string;
+  readonly createdAt: Date;
+}
+
+export interface RefundRepository {
+  /**
+   * INSERT ... ON CONFLICT (order_item_id) DO NOTHING.
+   *
+   * The mirror image of DeliveryRepository.recordIfAbsent. One says a line is
+   * delivered at most once, this one says it is refunded at most once, and
+   * together they make double spending on either side a constraint violation
+   * rather than something the retry logic has to be trusted about.
+   */
+  recordIfAbsent(tx: TransactionScope, refund: Omit<RefundRecord, 'createdAt'>): Promise<boolean>;
+  findByOrder(exec: Executor, orderId: string): Promise<readonly RefundRecord[]>;
 }
 
 export interface LedgerRepository {

@@ -12,6 +12,7 @@ import {
   awaitsDelivery,
   canTransition,
   decidePaymentEffect,
+  deriveOrderStatus,
   isRecoverable,
   isTerminal,
   assertTransition,
@@ -19,15 +20,29 @@ import {
   type OrderStatus,
 } from '../../src/domain/order/status.js';
 
+/**
+ * The settling states (delivered, partially_delivered, refunded) are reachable
+ * from every non final fulfilment state, because settlement can run at any point
+ * once the lines resolve and does not care how the order got there.
+ */
+const SETTLING: readonly OrderStatus[] = ['delivered', 'partially_delivered', 'refunded'];
+
 const ALLOWED: ReadonlyArray<[OrderStatus, OrderStatus]> = [
   ['created', 'paid'],
   ['created', 'payment_failed'],
   ['paid', 'delivering'],
-  ['delivering', 'delivered'],
+  ['paid', 'out_of_stock'],
+  ['paid', 'delivery_failed'],
+  ...SETTLING.map((to): [OrderStatus, OrderStatus] => ['paid', to]),
   ['delivering', 'out_of_stock'],
   ['delivering', 'delivery_failed'],
+  ...SETTLING.map((to): [OrderStatus, OrderStatus] => ['delivering', to]),
   ['out_of_stock', 'delivering'],
+  ['out_of_stock', 'delivery_failed'],
+  ...SETTLING.map((to): [OrderStatus, OrderStatus] => ['out_of_stock', to]),
   ['delivery_failed', 'delivering'],
+  ['delivery_failed', 'out_of_stock'],
+  ...SETTLING.map((to): [OrderStatus, OrderStatus] => ['delivery_failed', to]),
 ];
 
 describe('order state machine', () => {
@@ -64,6 +79,26 @@ describe('order state machine', () => {
       ORDER_STATUSES.filter(awaitsDelivery).sort(),
       ['delivering', 'delivery_failed', 'out_of_stock', 'paid'],
     );
+  });
+
+  it('derives the order status from its lines and never invents an outcome', () => {
+    const line = (status: 'delivered' | 'refunded' | 'pending' | 'out_of_stock' | 'delivery_failed') =>
+      ({ status }) as const;
+
+    assert.equal(deriveOrderStatus([line('delivered'), line('delivered')]), 'delivered');
+    assert.equal(deriveOrderStatus([line('refunded'), line('refunded')]), 'refunded');
+    // The case this stage exists for: some goods handed over, the rest paid back.
+    assert.equal(deriveOrderStatus([line('delivered'), line('refunded')]), 'partially_delivered');
+
+    // An unresolved line means the order is not finished, whatever the others
+    // did. It reports the worst open state, because that is the one somebody has
+    // to act on.
+    assert.equal(deriveOrderStatus([line('delivered'), line('pending')]), null);
+    assert.equal(deriveOrderStatus([line('delivered'), line('out_of_stock')]), 'out_of_stock');
+    assert.equal(deriveOrderStatus([line('out_of_stock'), line('delivery_failed')]), 'delivery_failed');
+    // A single line basket reduces exactly to the first stage's behaviour.
+    assert.equal(deriveOrderStatus([line('out_of_stock')]), 'out_of_stock');
+    assert.equal(deriveOrderStatus([]), null);
   });
 
   it('throws with both statuses named when an illegal transition is attempted', () => {

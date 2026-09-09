@@ -15,6 +15,7 @@ const CONTENTION_BACKOFF_MS = 10;
 
 export interface Issuance {
   readonly requestId: string;
+  readonly sku: string;
   readonly code: string;
   /** True when this call minted the code, false when an earlier call already had. */
   readonly fresh: boolean;
@@ -59,7 +60,7 @@ export class SupplierStore {
    * counting what remains before answering, because reporting out_of_stock when
    * stock exists would push a paid order into recovery for no reason.
    */
-  async issue(requestId: string, orderId: string, sku: string): Promise<Issuance> {
+  async issue(requestId: string, orderId: string, orderItemId: string, sku: string): Promise<Issuance> {
     const existing = await this.findIssuance(requestId);
     if (existing) return { ...existing, fresh: false };
 
@@ -73,14 +74,14 @@ export class SupplierStore {
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [requestId]);
 
         // Re-read under the lock: a concurrent call may have issued while we waited.
-        const alreadyIssued = await client.query<{ code: string }>(
-          `SELECT code FROM supplier_stub.issuances WHERE request_id = $1 AND supplier = $2`,
+        const alreadyIssued = await client.query<{ sku: string; code: string }>(
+          `SELECT sku, code FROM supplier_stub.issuances WHERE request_id = $1 AND supplier = $2`,
           [requestId, this.supplier],
         );
         const winner = alreadyIssued.rows[0];
         if (winner) {
           await client.query('ROLLBACK');
-          return { requestId, code: winner.code, fresh: false };
+          return { requestId, sku: winner.sku, code: winner.code, fresh: false };
         }
 
         const key = await client.query<{ id: number; code: string }>(
@@ -108,11 +109,11 @@ export class SupplierStore {
 
         await client.query(`UPDATE supplier_stub.keys SET state = 'issued' WHERE id = $1`, [row.id]);
         const inserted = await client.query<{ request_id: string }>(
-          `INSERT INTO supplier_stub.issuances (request_id, supplier, order_id, sku, code, key_id)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO supplier_stub.issuances (request_id, supplier, order_id, order_item_id, sku, code, key_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (request_id) DO NOTHING
            RETURNING request_id`,
-          [requestId, this.supplier, orderId, sku, row.code, row.id],
+          [requestId, this.supplier, orderId, orderItemId, sku, row.code, row.id],
         );
 
         if (inserted.rowCount === 0) {
@@ -125,7 +126,7 @@ export class SupplierStore {
         }
 
         await client.query('COMMIT');
-        return { requestId, code: row.code, fresh: true };
+        return { requestId, sku, code: row.code, fresh: true };
       } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined);
         throw error;
@@ -137,22 +138,41 @@ export class SupplierStore {
     throw new OutOfStockError(sku);
   }
 
-  async findIssuance(requestId: string): Promise<{ requestId: string; code: string } | null> {
-    const result = await this.pool.query<{ request_id: string; code: string }>(
-      `SELECT request_id, code FROM supplier_stub.issuances WHERE request_id = $1 AND supplier = $2`,
+  async findIssuance(requestId: string): Promise<{ requestId: string; sku: string; code: string } | null> {
+    const result = await this.pool.query<{ request_id: string; sku: string; code: string }>(
+      `SELECT request_id, sku, code FROM supplier_stub.issuances WHERE request_id = $1 AND supplier = $2`,
       [requestId, this.supplier],
     );
     const row = result.rows[0];
-    return row ? { requestId: row.request_id, code: row.code } : null;
+    return row ? { requestId: row.request_id, sku: row.sku, code: row.code } : null;
   }
 
-  async issuancesForOrder(orderId: string): Promise<Array<{ requestId: string; code: string; createdAt: Date }>> {
-    const result = await this.pool.query<{ request_id: string; code: string; created_at: Date }>(
-      `SELECT request_id, code, created_at FROM supplier_stub.issuances
-        WHERE order_id = $1 AND supplier = $2 ORDER BY created_at`,
-      [orderId, this.supplier],
+  /**
+   * Every code this supplier issued against an order or a single line of one.
+   *
+   * Both keys are accepted because both questions are asked: "did this basket
+   * consume more codes than it has lines" and "did this LINE ever get two",
+   * which is the exactly-once assertion the adversarial tests turn on.
+   */
+  async issuancesForOrder(
+    key: string,
+  ): Promise<Array<{ requestId: string; orderItemId: string | null; code: string; createdAt: Date }>> {
+    const result = await this.pool.query<{
+      request_id: string;
+      order_item_id: string | null;
+      code: string;
+      created_at: Date;
+    }>(
+      `SELECT request_id, order_item_id, code, created_at FROM supplier_stub.issuances
+        WHERE (order_id = $1 OR order_item_id = $1) AND supplier = $2 ORDER BY created_at`,
+      [key, this.supplier],
     );
-    return result.rows.map((row) => ({ requestId: row.request_id, code: row.code, createdAt: row.created_at }));
+    return result.rows.map((row) => ({
+      requestId: row.request_id,
+      orderItemId: row.order_item_id,
+      code: row.code,
+      createdAt: row.created_at,
+    }));
   }
 
   async stock(): Promise<Array<{ sku: string; available: number }>> {

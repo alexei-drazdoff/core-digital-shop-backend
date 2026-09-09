@@ -14,8 +14,10 @@ import { createMetrics, type AppMetrics } from '../infrastructure/observability/
 
 import { PgProductRepository } from '../infrastructure/db/repositories/product-repository.js';
 import { PgOrderRepository } from '../infrastructure/db/repositories/order-repository.js';
+import { PgOrderItemRepository } from '../infrastructure/db/repositories/order-item-repository.js';
 import { PgPaymentEventRepository } from '../infrastructure/db/repositories/payment-event-repository.js';
 import { PgDeliveryRepository, PgSupplierRequestRepository } from '../infrastructure/db/repositories/delivery-repository.js';
+import { PgRefundRepository } from '../infrastructure/db/repositories/refund-repository.js';
 import { PgLedgerRepository } from '../infrastructure/db/repositories/ledger-repository.js';
 import { PgIdempotencyRepository } from '../infrastructure/db/repositories/idempotency-repository.js';
 import { PgReconciliationRepository } from '../infrastructure/db/repositories/reconciliation-repository.js';
@@ -27,7 +29,8 @@ import { systemClock, type Clock } from '../application/ports/clock.js';
 import type { SupplierGateway } from '../application/ports/supplier-gateway.js';
 import { CreateOrderUseCase } from '../application/use-cases/create-order.js';
 import { ApplyPaymentEventUseCase } from '../application/use-cases/apply-payment-event.js';
-import { DeliverOrderUseCase } from '../application/use-cases/deliver-order.js';
+import { DeliverOrderItemUseCase } from '../application/use-cases/deliver-order-item.js';
+import { SettleOrderUseCase } from '../application/use-cases/settle-order.js';
 import { ReconcileSupplierRequestUseCase } from '../application/use-cases/reconcile-supplier-request.js';
 import { RecoverStuckOrdersUseCase } from '../application/use-cases/recover-stuck-orders.js';
 import { SyncStockUseCase } from '../application/use-cases/sync-stock.js';
@@ -44,9 +47,11 @@ export interface Container {
   readonly repositories: {
     products: PgProductRepository;
     orders: PgOrderRepository;
+    orderItems: PgOrderItemRepository;
     paymentEvents: PgPaymentEventRepository;
     deliveries: PgDeliveryRepository;
     supplierRequests: PgSupplierRequestRepository;
+    refunds: PgRefundRepository;
     ledger: PgLedgerRepository;
     idempotency: PgIdempotencyRepository;
     reconciliation: PgReconciliationRepository;
@@ -55,7 +60,8 @@ export interface Container {
   readonly useCases: {
     createOrder: CreateOrderUseCase;
     applyPaymentEvent: ApplyPaymentEventUseCase;
-    deliverOrder: DeliverOrderUseCase;
+    deliverOrderItem: DeliverOrderItemUseCase;
+    settleOrder: SettleOrderUseCase;
     reconcileSupplierRequest: ReconcileSupplierRequestUseCase;
     recoverStuckOrders: RecoverStuckOrdersUseCase;
     syncStock: SyncStockUseCase;
@@ -81,9 +87,11 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
 
   const products = new PgProductRepository();
   const orders = new PgOrderRepository();
+  const orderItems = new PgOrderItemRepository();
   const paymentEvents = new PgPaymentEventRepository();
   const deliveries = new PgDeliveryRepository();
   const supplierRequests = new PgSupplierRequestRepository();
+  const refunds = new PgRefundRepository();
   const ledger = new PgLedgerRepository();
   const idempotency = new PgIdempotencyRepository();
   const reconciliation = new PgReconciliationRepository(pool, ledger);
@@ -110,12 +118,21 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
         }),
     );
 
-  const applyPaymentEvent = new ApplyPaymentEventUseCase({ uow, orders, paymentEvents, ledger, queue, logger });
+  const applyPaymentEvent = new ApplyPaymentEventUseCase({
+    uow,
+    orders,
+    orderItems,
+    paymentEvents,
+    ledger,
+    queue,
+    logger,
+  });
 
   const createOrder = new CreateOrderUseCase({
     uow,
     products,
     orders,
+    orderItems,
     paymentEvents,
     idempotency,
     applyPaymentEvent,
@@ -123,9 +140,10 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     logger,
   });
 
-  const deliverOrder = new DeliverOrderUseCase({
+  const deliverOrderItem = new DeliverOrderItemUseCase({
     uow,
     orders,
+    orderItems,
     products,
     deliveries,
     supplierRequests,
@@ -141,13 +159,24 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     },
   });
 
-  const reconcileSupplierRequest = new ReconcileSupplierRequestUseCase({
+  const settleOrder = new SettleOrderUseCase({
     uow,
     orders,
+    orderItems,
+    refunds,
+    ledger,
+    logger,
+    options: { maxDeliveryRounds: config.ITEM_MAX_DELIVERY_ROUNDS },
+  });
+
+  const reconcileSupplierRequest = new ReconcileSupplierRequestUseCase({
+    uow,
+    orderItems,
     products,
     deliveries,
     supplierRequests,
     ledger,
+    queue,
     suppliers,
     metrics,
     logger,
@@ -156,11 +185,13 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
   const recoverStuckOrders = new RecoverStuckOrdersUseCase({
     uow,
     orders,
+    orderItems,
     paymentEvents,
     queue,
     clock,
     logger,
     stuckAfterMs: config.STUCK_ORDER_AFTER_MS,
+    maxDeliveryRounds: config.ITEM_MAX_DELIVERY_ROUNDS,
   });
 
   const syncStock = new SyncStockUseCase({ uow, products, suppliers, logger });
@@ -173,9 +204,28 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     metrics,
     clock,
     suppliers,
-    repositories: { products, orders, paymentEvents, deliveries, supplierRequests, ledger, idempotency, reconciliation },
+    repositories: {
+      products,
+      orders,
+      orderItems,
+      paymentEvents,
+      deliveries,
+      supplierRequests,
+      refunds,
+      ledger,
+      idempotency,
+      reconciliation,
+    },
     queue,
-    useCases: { createOrder, applyPaymentEvent, deliverOrder, reconcileSupplierRequest, recoverStuckOrders, syncStock },
+    useCases: {
+      createOrder,
+      applyPaymentEvent,
+      deliverOrderItem,
+      settleOrder,
+      reconcileSupplierRequest,
+      recoverStuckOrders,
+      syncStock,
+    },
     async shutdown() {
       await pool.end();
     },

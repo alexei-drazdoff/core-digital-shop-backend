@@ -35,6 +35,17 @@ const envSchema = z.object({
   SUPPLIER_BACKOFF_BASE_MS: z.coerce.number().int().positive().default(100),
   SUPPLIER_BACKOFF_MAX_MS: z.coerce.number().int().positive().default(2_000),
 
+  /**
+   * Full passes through every supplier before a line is refunded.
+   *
+   * A round is one pass, not one HTTP attempt: the retries inside a supplier are
+   * the timeout trap being handled. Bounded because "за что не смогли, деньги
+   * возвращаются" is only true if the trying eventually stops — an unbounded
+   * retry would leave an out of stock line pending forever with the customer's
+   * money still ours.
+   */
+  ITEM_MAX_DELIVERY_ROUNDS: z.coerce.number().int().min(1).default(3),
+
   /** Consecutive failures before a supplier circuit opens. */
   CIRCUIT_FAILURE_THRESHOLD: z.coerce.number().int().min(1).default(5),
   CIRCUIT_OPEN_MS: z.coerce.number().int().positive().default(5_000),

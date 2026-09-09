@@ -15,6 +15,8 @@ const issueBody = z.object({
   request_id: z.string().min(1),
   sku: z.string().min(1),
   order_id: z.string().min(1),
+  /** The line the code is for. Optional so first stage callers still work. */
+  order_item_id: z.string().min(1).optional(),
 });
 
 const chaosBody = z.object({
@@ -64,6 +66,11 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
       return reply.code(400).send({ status: 'error', reason: 'invalid_request' });
     }
     const { request_id: requestId, sku, order_id: orderId } = parsed.data;
+    // The line, when the caller names one. Recorded alongside the order so
+    // /admin/issuances can be asked "how many codes did this LINE consume",
+    // which is the exactly-once assertion that matters once one order makes
+    // several calls.
+    const orderItemId = parsed.data.order_item_id ?? orderId;
     const chaos = await store.getChaos();
 
     if (chaos.latencyMs > 0) await delay(chaos.latencyMs);
@@ -75,7 +82,7 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
     if (chaos.hangBeforeLookup && decideOutcome(chaos, random) === 'timeout') {
       if (chaos.issueBeforeHang) {
         try {
-          await store.issue(requestId, orderId, sku);
+          await store.issue(requestId, orderId, orderItemId, sku);
         } catch (error) {
           if (!(error instanceof OutOfStockError)) throw error;
         }
@@ -89,7 +96,7 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
     // and the caller could never recover from a timeout.
     const existing = await store.findIssuance(requestId);
     if (existing) {
-      return reply.code(200).send({ status: 'ok', request_id: requestId, code: existing.code });
+      return reply.code(200).send({ status: 'ok', request_id: requestId, sku: existing.sku, code: existing.code });
     }
 
     const outcome = decideOutcome(chaos, random);
@@ -107,7 +114,7 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
       // lost in transit. The caller must not treat this as a refusal.
       if (chaos.issueBeforeHang) {
         try {
-          await store.issue(requestId, orderId, sku);
+          await store.issue(requestId, orderId, orderItemId, sku);
         } catch (error) {
           if (!(error instanceof OutOfStockError)) throw error;
         }
@@ -117,8 +124,8 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
     }
 
     try {
-      const issuance = await store.issue(requestId, orderId, sku);
-      return reply.code(200).send({ status: 'ok', request_id: requestId, code: issuance.code });
+      const issuance = await store.issue(requestId, orderId, orderItemId, sku);
+      return reply.code(200).send({ status: 'ok', request_id: requestId, sku, code: issuance.code });
     } catch (error) {
       if (error instanceof OutOfStockError) {
         return reply.code(409).send({ status: 'error', reason: 'out_of_stock' });
@@ -132,9 +139,10 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
   app.get('/stock', async () => ({ supplier, items: await store.stock() }));
 
   app.get('/admin/issuances', async (request) => {
-    const orderId = (request.query as { order_id?: string }).order_id;
-    if (!orderId) return { supplier, issuances: [] };
-    return { supplier, issuances: await store.issuancesForOrder(orderId) };
+    const query = request.query as { order_id?: string; order_item_id?: string };
+    const key = query.order_item_id ?? query.order_id;
+    if (!key) return { supplier, issuances: [] };
+    return { supplier, issuances: await store.issuancesForOrder(key) };
   });
 
   app.get('/admin/chaos', async () => ({ supplier, chaos: await store.getChaos() }));

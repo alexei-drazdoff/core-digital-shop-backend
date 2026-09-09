@@ -6,7 +6,11 @@
  * id semantics that belong to the delivery use case, not to transport.
  */
 import { request } from 'undici';
-import type { SupplierGateway, SupplierResult } from '../../application/ports/supplier-gateway.js';
+import type {
+  SupplierGateway,
+  SupplierIssueRequest,
+  SupplierResult,
+} from '../../application/ports/supplier-gateway.js';
 import type { Logger } from '../observability/logger.js';
 import type { CircuitBreaker } from './circuit-breaker.js';
 
@@ -31,7 +35,7 @@ export class HttpSupplierGateway implements SupplierGateway {
     this.name = options.name;
   }
 
-  async issue(input: { requestId: string; orderId: string; sku: string }): Promise<SupplierResult> {
+  async issue(input: SupplierIssueRequest): Promise<SupplierResult> {
     const { baseUrl, timeoutMs, breaker, logger } = this.options;
 
     if (!breaker.allowsRequest()) {
@@ -45,7 +49,12 @@ export class HttpSupplierGateway implements SupplierGateway {
       const response = await request(`${baseUrl}/issue`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ request_id: input.requestId, sku: input.sku, order_id: input.orderId }),
+        body: JSON.stringify({
+          request_id: input.requestId,
+          sku: input.sku,
+          order_id: input.orderId,
+          order_item_id: input.orderItemId,
+        }),
         headersTimeout: timeoutMs,
         bodyTimeout: timeoutMs,
       });
@@ -87,7 +96,13 @@ export class HttpSupplierGateway implements SupplierGateway {
       // issued a code. Reporting this as a refusal would be the bug the whole
       // design exists to avoid.
       logger.warn(
-        { supplier: this.name, request_id: input.requestId, order_id: input.orderId, latency_ms: latencyMs, detail },
+        {
+          supplier: this.name,
+          request_id: input.requestId,
+          order_item_id: input.orderItemId,
+          latency_ms: latencyMs,
+          detail,
+        },
         'supplier call did not complete, outcome is indeterminate',
       );
       return {

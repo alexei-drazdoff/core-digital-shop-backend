@@ -19,6 +19,7 @@ import type { JobQueue } from '../ports/queue.js';
 import type {
   IncomingPaymentEvent,
   LedgerRepository,
+  OrderItemRepository,
   OrderRepository,
   PaymentEventOutcome,
   PaymentEventRepository,
@@ -34,8 +35,13 @@ export type ApplyPaymentResult =
   | { readonly kind: 'applied'; readonly nextStatus: string }
   | { readonly kind: 'ignored'; readonly outcome: PaymentEventOutcome };
 
-export function deliveryJobDedupeKey(orderId: string): string {
-  return `deliver:${orderId}`;
+export function deliveryJobDedupeKey(orderItemId: string): string {
+  return `deliver:${orderItemId}`;
+}
+
+/** One settlement per order, however many lines finished at once. */
+export function settlementJobDedupeKey(orderId: string): string {
+  return `settle:${orderId}`;
 }
 
 export class ApplyPaymentEventUseCase {
@@ -43,6 +49,7 @@ export class ApplyPaymentEventUseCase {
     private readonly deps: {
       uow: UnitOfWork;
       orders: OrderRepository;
+      orderItems: OrderItemRepository;
       paymentEvents: PaymentEventRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
@@ -85,7 +92,7 @@ export class ApplyPaymentEventUseCase {
 
   /** Everything both paths share, once the event is exclusively held. */
   private async applyToOrder(tx: TransactionScope, event: IncomingPaymentEvent): Promise<ApplyPaymentResult> {
-    const { orders, paymentEvents, ledger, queue, logger } = this.deps;
+    const { orders, orderItems, paymentEvents, ledger, queue, logger } = this.deps;
 
     // Serialises distinct events racing for the same order. No supplier call
     // ever happens while this lock is held, so it cannot be pinned by a timeout.
@@ -137,13 +144,22 @@ export class ApplyPaymentEventUseCase {
         }),
       );
 
-      // The outbox write. Commits with the status change, so "paid" and
-      // "delivery scheduled" are one atomic fact.
-      await queue.enqueue(tx, {
-        kind: 'deliver_order',
-        dedupeKey: deliveryJobDedupeKey(order.id),
-        payload: { orderId: order.id },
-      });
+      // The outbox write, fanned out over the basket.
+      //
+      // One job per line rather than one per order, because the lines are
+      // independent: a supplier that hangs on line 1 must not hold line 2, and a
+      // retry of line 1 must not re-drive a line that already succeeded. It is
+      // still the same atomic fact as before, just wider — "paid" and "every
+      // line scheduled" commit together, so no line can be paid for and
+      // forgotten.
+      const items = await orderItems.findByOrder(tx, order.id);
+      for (const item of items) {
+        await queue.enqueue(tx, {
+          kind: 'deliver_order_item',
+          dedupeKey: deliveryJobDedupeKey(item.id),
+          payload: { orderItemId: item.id },
+        });
+      }
     }
 
     await paymentEvents.markProcessed(tx, event.eventId, 'applied');

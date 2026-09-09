@@ -16,10 +16,11 @@ export class PgLedgerRepository implements LedgerRepository {
     if (entries.length === 0) return;
     const values: unknown[] = [];
     const tuples = entries.map((entry, index) => {
-      const base = index * 8;
+      const base = index * 9;
       values.push(
         entry.groupId,
         entry.orderId,
+        entry.orderItemId,
         entry.account,
         entry.direction,
         entry.amountMinor,
@@ -27,11 +28,12 @@ export class PgLedgerRepository implements LedgerRepository {
         entry.refType,
         entry.refId,
       );
-      return `($${base + 1}::uuid, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`;
+      return `($${base + 1}::uuid, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`;
     });
 
     await tx.query(
-      `INSERT INTO ledger_entries (group_id, order_id, account, direction, amount_minor, currency, ref_type, ref_id)
+      `INSERT INTO ledger_entries
+         (group_id, order_id, order_item_id, account, direction, amount_minor, currency, ref_type, ref_id)
        VALUES ${tuples.join(', ')}
        ON CONFLICT (ref_type, ref_id, account, direction) DO NOTHING`,
       values,

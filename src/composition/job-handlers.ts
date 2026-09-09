@@ -14,11 +14,21 @@ export function buildJobHandlers(container: Container): Readonly<Record<JobKind,
   const { useCases, logger } = container;
 
   return {
-    deliver_order: async (job: Job) => {
+    deliver_order_item: async (job: Job) => {
+      const orderItemId = job.payload['orderItemId'];
+      if (typeof orderItemId !== 'string') throw new Error('deliver_order_item job is missing orderItemId');
+      const result = await useCases.deliverOrderItem.execute(orderItemId);
+      logger.debug({ order_item_id: orderItemId, result: result.kind }, 'delivery job finished');
+    },
+
+    settle_order: async (job: Job) => {
       const orderId = job.payload['orderId'];
-      if (typeof orderId !== 'string') throw new Error('deliver_order job is missing orderId');
-      const result = await useCases.deliverOrder.execute(orderId);
-      logger.debug({ order_id: orderId, result: result.kind }, 'delivery job finished');
+      if (typeof orderId !== 'string') throw new Error('settle_order job is missing orderId');
+      const result = await useCases.settleOrder.execute(orderId);
+      logger.debug(
+        { order_id: orderId, status: result.status, refunds: result.refundsWritten },
+        'settlement job finished',
+      );
     },
 
     reconcile_supplier_request: async (job: Job) => {

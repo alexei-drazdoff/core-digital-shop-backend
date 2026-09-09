@@ -67,12 +67,17 @@ describe('reconciliation staleness is measured from the payment, not the last re
     await harness.drain();
     assert.equal((await harness.getOrder(orderId))['status'], 'out_of_stock', 'the retry cannot succeed, the pool is empty');
 
+    // The retry writes updated_at on the LINE, which is where fulfilment now
+    // lives. That is exactly the column a naive report would key off, and the
+    // reason it must not.
     const touched = await harness.pool.query<{ updated_at: Date; paid_at: Date }>(
-      'SELECT updated_at, paid_at FROM orders WHERE id = $1',
+      `SELECT i.updated_at, o.paid_at
+         FROM order_items i JOIN orders o ON o.id = i.order_id
+        WHERE i.order_id = $1`,
       [orderId],
     );
     const row = touched.rows[0];
-    assert.ok(row, 'the order must still exist');
+    assert.ok(row, 'the order line must still exist');
     assert.ok(
       row.updated_at.getTime() > row.paid_at.getTime() + 60_000,
       'the retry must have refreshed updated_at, otherwise this test proves nothing',
