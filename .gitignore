@@ -6,3 +6,11 @@ coverage/
 *.log
 .pgdata/
 .DS_Store
+
+# Локальные заметки и настройки инструментов, не часть сдаваемой работы
+CLAUDE.md
+.claude/
+.codex/
+GEMINI.md
+.gemini/
+scratchpad/
