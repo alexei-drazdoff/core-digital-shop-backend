@@ -39,6 +39,7 @@ export class PgReconciliationRepository implements ReconciliationRepository {
       unsettledOrders,
       unresolved,
       orphans,
+      quarantined,
       deferred,
       deadJobs,
       ledgerImbalances,
@@ -50,6 +51,7 @@ export class PgReconciliationRepository implements ReconciliationRepository {
       this.unsettledOrders(staleAfter),
       this.unresolvedSupplierRequests(),
       this.orphanIssuances(),
+      this.quarantinedCodes(),
       this.deferredPaymentEvents(),
       this.deadJobs(),
       this.ledger.unbalancedGroups(this.exec),
@@ -64,6 +66,7 @@ export class PgReconciliationRepository implements ReconciliationRepository {
       unsettledOrders,
       unresolvedSupplierRequests: unresolved,
       orphanIssuances: orphans,
+      quarantinedCodes: quarantined,
       deferredPaymentEvents: deferred,
       deadJobs,
       ledgerImbalances,
@@ -214,6 +217,26 @@ export class PgReconciliationRepository implements ReconciliationRepository {
          FROM orphan_issuances oi
          JOIN order_items i ON i.id = oi.order_item_id
         ORDER BY oi.detected_at`,
+    );
+    return toRows(result.rows);
+  }
+
+  /**
+   * Codes a supplier offered and we refused.
+   *
+   * The order_id is the request the bad answer came back for, which is the
+   * thread to pull on when working out what a supplier is doing wrong.
+   */
+  private async quarantinedCodes(): Promise<ReconciliationRow[]> {
+    const result = await this.exec.query<RawRow>(
+      `SELECT COALESCE(ic.order_id, ic.request_id) AS order_id, '' AS sku,
+              'quarantined' AS status, 0::bigint AS amount_minor,
+              'supplier ' || ic.supplier || ' offered an unusable code for request '
+                || ic.request_id || ': ' || COALESCE(ic.reason, '') AS detail,
+              ic.created_at AS since
+         FROM issued_codes ic
+        WHERE ic.disposition = 'quarantined'
+        ORDER BY ic.created_at`,
     );
     return toRows(result.rows);
   }

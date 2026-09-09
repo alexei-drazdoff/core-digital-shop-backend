@@ -4,6 +4,8 @@ export interface DeliveryMetrics {
   recordRetry(supplier: string): void;
   recordDelivery(supplier: string): void;
   recordOrphan(supplier: string): void;
+  /** A supplier answer refused as invalid. The signal that one is misbehaving. */
+  recordRejection(supplier: string, reason: string): void;
 }
 
 export const noopDeliveryMetrics: DeliveryMetrics = {
@@ -11,4 +13,5 @@ export const noopDeliveryMetrics: DeliveryMetrics = {
   recordRetry: () => {},
   recordDelivery: () => {},
   recordOrphan: () => {},
+  recordRejection: () => {},
 };

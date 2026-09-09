@@ -36,6 +36,17 @@ const envSchema = z.object({
   SUPPLIER_BACKOFF_MAX_MS: z.coerce.number().int().positive().default(2_000),
 
   /**
+   * Fresh request epochs to open at one supplier whose answers keep being
+   * refused as invalid.
+   *
+   * Low on purpose. Each epoch is a new request to a supplier that has already
+   * handed back somebody else's code, so persisting mostly consumes its stock.
+   * Two says the first bad answer might have been a glitch; after that the
+   * fallback is the better bet.
+   */
+  SUPPLIER_MAX_EPOCHS: z.coerce.number().int().min(1).default(2),
+
+  /**
    * Full passes through every supplier before a line is refunded.
    *
    * A round is one pass, not one HTTP attempt: the retries inside a supplier are

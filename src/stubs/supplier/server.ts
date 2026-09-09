@@ -26,7 +26,10 @@ const chaosBody = z.object({
   hang_ms: z.number().int().min(0).optional(),
   issue_before_hang: z.boolean().optional(),
   hang_before_lookup: z.boolean().optional(),
-  forced_outcome: z.enum(['ok', 'error', 'timeout', 'out_of_stock']).nullable().optional(),
+  forced_outcome: z
+    .enum(['ok', 'error', 'timeout', 'out_of_stock', 'duplicate_code', 'foreign_code', 'error_after_issue'])
+    .nullable()
+    .optional(),
 });
 
 const replenishBody = z.object({
@@ -35,7 +38,13 @@ const replenishBody = z.object({
   codes: z.array(z.string().min(1)).optional(),
 });
 
-type Outcome = 'ok' | 'error' | 'timeout' | 'out_of_stock';
+/**
+ * The last three are the second stage's additions: a supplier that is not merely
+ * unreliable but dishonest. They are qualitatively different from the first
+ * three, which all describe an ANSWER GOING MISSING. These describe an answer
+ * arriving with nothing true behind it, which no amount of retrying can fix.
+ */
+type Outcome = 'ok' | 'error' | 'timeout' | 'out_of_stock' | 'duplicate_code' | 'foreign_code' | 'error_after_issue';
 
 /** forced_outcome wins so tests are deterministic; otherwise the rates decide. */
 function decideOutcome(chaos: ChaosConfig, random: () => number): Outcome {
@@ -106,6 +115,52 @@ export function createSupplierStub(options: SupplierStubOptions): FastifyInstanc
     }
     if (outcome === 'out_of_stock') {
       return reply.code(409).send({ status: 'error', reason: 'out_of_stock' });
+    }
+
+    // A code that belongs to somebody else's request.
+    //
+    // Nothing is consumed and nothing is recorded: the stub simply says a
+    // sentence that is not true. That is the shape of the failure — there is no
+    // supplier-side state the caller could query to discover it, so the caller
+    // has to know from its OWN records that this code is already spoken for.
+    if (outcome === 'duplicate_code') {
+      const duplicate = await store.someOtherIssuedCode(requestId);
+      if (duplicate) {
+        return reply.code(200).send({ status: 'ok', request_id: requestId, sku, code: duplicate });
+      }
+      // Nothing to duplicate yet. Falling through to the honest path rather than
+      // inventing a code keeps a test that asks for this too early failing
+      // loudly instead of passing on a fabrication.
+    }
+
+    // A code for a different product. The customer would get a key they did not
+    // buy, and the real buyer of that key would later be handed it too.
+    if (outcome === 'foreign_code') {
+      const foreign = await store.someForeignCode(sku);
+      if (foreign) {
+        // The sku reported is the code's REAL one, not the one that was asked
+        // for. That is the honest shape of this bug: the supplier's own records
+        // are correct, it simply reached into the wrong pool, and it says so.
+        // A supplier that also lied about the sku would be undetectable from the
+        // response alone — and it is caught anyway, by the code registry, the
+        // moment the rightful buyer of that key comes along.
+        return reply.code(200).send({ status: 'ok', request_id: requestId, sku: foreign.sku, code: foreign.code });
+      }
+    }
+
+    // Consumed a key, then answered with an error.
+    //
+    // Distinct from the timeout trap, and worth its own mode: a timeout says "no
+    // answer arrived", which the caller already treats as indeterminate. An
+    // explicit 503 says "this definitively failed", which is the answer that
+    // tempts a caller into failing over immediately — and the key is gone.
+    if (outcome === 'error_after_issue') {
+      try {
+        await store.issue(requestId, orderId, orderItemId, sku);
+      } catch (error) {
+        if (!(error instanceof OutOfStockError)) throw error;
+      }
+      return reply.code(503).send({ status: 'error', reason: 'supplier_unavailable' });
     }
 
     if (outcome === 'timeout') {

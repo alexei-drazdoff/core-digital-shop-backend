@@ -34,6 +34,15 @@ async function main(): Promise<void> {
       setInterval(() => {
         void useCases.syncStock.execute().catch((error: Error) => logger.error({ err: error }, 'stock sync failed'));
       }, config.STOCK_SYNC_INTERVAL_MS),
+      // Supplier claims nobody is chasing. Separate from the recovery sweep
+      // because it answers a different question: recovery asks "does a customer
+      // still owe goods", this asks "did a supplier consume a key we never
+      // accounted for". An order can be perfectly delivered and still have one.
+      setInterval(() => {
+        void useCases.sweepSupplierDiscrepancies
+          .execute()
+          .catch((error: Error) => logger.error({ err: error }, 'supplier discrepancy sweep failed'));
+      }, config.RECOVERY_SCAN_INTERVAL_MS),
     );
   }
 

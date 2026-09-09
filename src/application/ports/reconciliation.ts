@@ -35,6 +35,16 @@ export interface ReconciliationReport {
   readonly unresolvedSupplierRequests: readonly ReconciliationRow[];
   /** Stock consumed with no sale behind it, already written off as shrinkage. */
   readonly orphanIssuances: readonly ReconciliationRow[];
+  /**
+   * Codes a supplier offered that were refused as invalid.
+   *
+   * Not a discrepancy in OUR books — nothing was paid for and nothing was
+   * handed over — but the clearest evidence that a supplier is misbehaving, and
+   * the only place it is visible. Excluded from the health verdict for the same
+   * reason orphans are: the system handled it correctly, and a supplier's bad
+   * behaviour is not this system being unhealthy.
+   */
+  readonly quarantinedCodes: readonly ReconciliationRow[];
   /** Webhooks that arrived before their order and are still waiting. */
   readonly deferredPaymentEvents: readonly ReconciliationRow[];
   /** Jobs that exhausted their retries. Visible rather than silently dropped. */

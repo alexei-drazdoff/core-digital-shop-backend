@@ -216,7 +216,8 @@ export interface SupplierRequestRepository {
       supplier: string;
       requestId: string;
       attemptNo: number;
-      outcome: 'issued' | 'refused' | 'timeout' | 'transport_error' | 'circuit_open';
+      /** `rejected` is the second stage's addition: the supplier answered, and the answer was unusable. */
+      outcome: 'issued' | 'refused' | 'timeout' | 'transport_error' | 'circuit_open' | 'rejected';
       latencyMs: number | null;
       error: string | null;
     },
@@ -254,6 +255,60 @@ export interface DeliveryRepository {
       note: string;
     },
   ): Promise<boolean>;
+}
+
+export type CodeDisposition = 'delivered' | 'orphan' | 'quarantined';
+
+export interface IssuedCodeRecord {
+  readonly code: string;
+  readonly supplier: string;
+  readonly requestId: string;
+  readonly orderItemId: string | null;
+  readonly orderId: string | null;
+  readonly disposition: CodeDisposition;
+  readonly reason: string | null;
+  readonly createdAt: Date;
+}
+
+/**
+ * Every code the system has ever seen, keyed BY THE CODE.
+ *
+ * This is what answers "один код никогда не уйдёт двум покупателям" against a
+ * supplier that cannot be trusted. The first stage's defences all protect
+ * against an answer going missing; none of them notice an answer that arrives
+ * carrying a code somebody else already owns, because that code looks perfectly
+ * valid at the point of use.
+ *
+ * The key is the code alone and not (supplier, code): a code that supplier B
+ * hands back after supplier A already sold it is exactly the case this exists to
+ * catch, and scoping uniqueness per supplier would miss it.
+ */
+export interface IssuedCodeRepository {
+  /**
+   * INSERT ... ON CONFLICT (code) DO NOTHING.
+   *
+   * False means this code is already spoken for. Always written in the same
+   * transaction as whatever was decided about the code, so the registry and the
+   * decision cannot disagree.
+   */
+  claim(tx: TransactionScope, record: Omit<IssuedCodeRecord, 'createdAt'>): Promise<boolean>;
+  /**
+   * Changes what a code we already hold is FOR, never who holds it.
+   *
+   * A code claimed for a line that then lost the delivery race is stock consumed
+   * with no sale behind it, so it becomes an orphan. The code stays ours either
+   * way — that is the part that must not change, because releasing it would put
+   * a code that a supplier already spent back into circulation.
+   */
+  reclassify(
+    tx: TransactionScope,
+    code: string,
+    disposition: CodeDisposition,
+    reason: string | null,
+  ): Promise<void>;
+  find(exec: Executor, code: string): Promise<IssuedCodeRecord | null>;
+  /** Codes refused as invalid and never handed to anybody. Feeds the report. */
+  quarantined(exec: Executor, limit: number): Promise<readonly IssuedCodeRecord[]>;
 }
 
 export interface RefundRecord {

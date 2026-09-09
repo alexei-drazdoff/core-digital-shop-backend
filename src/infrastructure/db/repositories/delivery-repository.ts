@@ -149,7 +149,7 @@ export class PgSupplierRequestRepository implements SupplierRequestRepository {
       supplier: string;
       requestId: string;
       attemptNo: number;
-      outcome: 'issued' | 'refused' | 'timeout' | 'transport_error' | 'circuit_open';
+      outcome: 'issued' | 'refused' | 'timeout' | 'transport_error' | 'circuit_open' | 'rejected';
       latencyMs: number | null;
       error: string | null;
     },

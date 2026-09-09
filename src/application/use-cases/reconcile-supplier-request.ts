@@ -25,6 +25,7 @@ import type { SupplierGateway } from '../ports/supplier-gateway.js';
 import type { JobQueue } from '../ports/queue.js';
 import type {
   DeliveryRepository,
+  IssuedCodeRepository,
   LedgerRepository,
   OrderItemRepository,
   ProductRepository,
@@ -53,6 +54,7 @@ export class ReconcileSupplierRequestUseCase {
       products: ProductRepository;
       deliveries: DeliveryRepository;
       supplierRequests: SupplierRequestRepository;
+      issuedCodes: IssuedCodeRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
       suppliers: readonly SupplierGateway[];
@@ -151,11 +153,32 @@ export class ReconcileSupplierRequestUseCase {
     requestId: string,
     code: string,
   ): Promise<ReconcileResult> {
-    const { uow, orderItems, products, deliveries, ledger, metrics, logger } = this.deps;
+    const { uow, orderItems, products, deliveries, issuedCodes, ledger, metrics, logger } = this.deps;
 
     return uow.withTransaction(async (tx) => {
       const item = await orderItems.lockById(tx, orderItemId);
       if (!item) return { kind: 'nothing_to_do', reason: 'order_item_not_found' } as const;
+
+      // A recovered code has never been through the registry, so it is claimed
+      // here. Losing the claim means this code already belongs to somebody else,
+      // which for a recovered code means the supplier handed us a duplicate
+      // while we were not looking. It must not be delivered.
+      const mine = await issuedCodes.claim(tx, {
+        code,
+        supplier,
+        requestId,
+        orderItemId,
+        orderId: item.orderId,
+        disposition: 'delivered',
+        reason: null,
+      });
+      if (!mine) {
+        logger.error(
+          { order_item_id: orderItemId, supplier, request_id: requestId },
+          'recovered code is already registered to another line, refusing to deliver it',
+        );
+        return { kind: 'nothing_to_do', reason: 'code_already_issued' } as const;
+      }
 
       const recorded = await deliveries.recordIfAbsent(tx, {
         orderId: item.orderId,
@@ -175,6 +198,7 @@ export class ReconcileSupplierRequestUseCase {
           code,
           note: 'raced with the delivery worker',
         });
+        await issuedCodes.reclassify(tx, code, 'orphan', 'raced with the delivery worker');
         await ledger.append(
           tx,
           orphanIssuanceEntries({
@@ -222,7 +246,7 @@ export class ReconcileSupplierRequestUseCase {
     requestId: string,
     code: string,
   ): Promise<ReconcileResult> {
-    const { uow, orderItems, deliveries, ledger, metrics, logger } = this.deps;
+    const { uow, orderItems, deliveries, issuedCodes, ledger, metrics, logger } = this.deps;
 
     return uow.withTransaction(async (tx) => {
       const item = await orderItems.lockById(tx, orderItemId);
@@ -237,6 +261,19 @@ export class ReconcileSupplierRequestUseCase {
         note: 'supplier issued a code for a call that timed out, line was served by the fallback',
       });
       if (!fresh) return { kind: 'nothing_to_do', reason: 'orphan_already_recorded' } as const;
+
+      // Registered as ours so it can never be handed to anybody, even though
+      // nobody will ever use it. A code a supplier has spent must not look
+      // available to a later call.
+      await issuedCodes.claim(tx, {
+        code,
+        supplier,
+        requestId,
+        orderItemId,
+        orderId: item.orderId,
+        disposition: 'orphan',
+        reason: 'issued for a call that timed out',
+      });
 
       await ledger.append(
         tx,

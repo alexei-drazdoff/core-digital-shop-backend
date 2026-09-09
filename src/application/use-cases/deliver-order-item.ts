@@ -31,6 +31,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { supplierRequestId } from '../../domain/order/order.js';
 import { itemAwaitsDelivery } from '../../domain/order/status.js';
+import { rejectSupplierResponse, type ResponseRejection } from '../../domain/order/supplier-response.js';
 import { deliveryCostEntries, orphanIssuanceEntries } from '../../domain/ledger/entries.js';
 import { backoffDelayMs } from '../retry-policy.js';
 import { settlementJobDedupeKey } from './apply-payment-event.js';
@@ -38,6 +39,7 @@ import type { SupplierGateway, SupplierResult } from '../ports/supplier-gateway.
 import type { JobQueue } from '../ports/queue.js';
 import type {
   DeliveryRepository,
+  IssuedCodeRepository,
   LedgerRepository,
   OrderItemRepository,
   OrderRepository,
@@ -61,12 +63,24 @@ interface SupplierOutcome {
   readonly code: string | null;
   readonly refusedReason: string | null;
   readonly indeterminate: boolean;
+  /** True when every answer this supplier gave was refused as invalid. */
+  readonly rejected: boolean;
 }
 
 export interface DeliverOrderItemOptions {
   readonly maxAttemptsPerSupplier: number;
   readonly backoffBaseMs: number;
   readonly backoffMaxMs: number;
+  /**
+   * Fresh request epochs to open at one supplier when its answers keep being
+   * rejected as invalid.
+   *
+   * Bounded, and low. Each one is a new request to a supplier that has already
+   * proved it will hand back somebody else's code, so trying many times is
+   * mostly a way to consume its stock. Two says "the first bad answer might have
+   * been a glitch", and after that the fallback is a better bet.
+   */
+  readonly maxEpochsPerSupplier: number;
 }
 
 export class DeliverOrderItemUseCase {
@@ -78,6 +92,7 @@ export class DeliverOrderItemUseCase {
       products: ProductRepository;
       deliveries: DeliveryRepository;
       supplierRequests: SupplierRequestRepository;
+      issuedCodes: IssuedCodeRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
       /** Ordered: the first is primary, the rest are fallbacks. */
@@ -148,16 +163,20 @@ export class DeliverOrderItemUseCase {
   }
 
   /**
-   * Calls one supplier, retrying it with the SAME request id.
+   * Works one supplier until it produces a usable code or runs out of ways to.
    *
-   * Reusing the request id is what makes the retry safe: to the supplier it is
-   * the same request, so at most one code is ever issued for it however many
-   * times the call is repeated.
+   * Two nested loops with very different meanings, and confusing them is how a
+   * timeout turns into two issued codes:
    *
-   * The epoch is read rather than assumed. Resuming at the highest epoch already
-   * reached means a worker restarted after a crash re-asks about the call that
-   * may have produced a code, instead of opening a fresh request and buying a
-   * second one.
+   *   the INNER loop (askOnce) repeats the same request id, because the answer
+   *   went missing and the question has not been answered yet;
+   *
+   *   the OUTER loop here opens a NEW request id, because the answer arrived and
+   *   was a lie. Re-asking the same id would return the same lie forever.
+   *
+   * The outer loop runs only on rejection, and it is bounded low: each epoch is
+   * a fresh request to a supplier that has already proved it hands back other
+   * people's codes, so persisting mostly consumes its stock.
    */
   private async trySupplier(
     orderId: string,
@@ -165,10 +184,47 @@ export class DeliverOrderItemUseCase {
     sku: string,
     supplier: SupplierGateway,
   ): Promise<SupplierOutcome> {
+    const { uow, supplierRequests, options, logger } = this.deps;
+
+    // Read rather than assumed. Resuming at the highest epoch already reached
+    // means a worker restarted after a crash re-asks about the call that may
+    // have produced a code, instead of opening a fresh request and buying a
+    // second one.
+    let epoch = Math.max(1, await supplierRequests.latestEpoch(uow.executor, orderItemId, supplier.name));
+    let last: SupplierOutcome | null = null;
+
+    for (let round = 1; round <= options.maxEpochsPerSupplier; round += 1) {
+      const outcome = await this.askOnce(orderId, orderItemId, sku, supplier, epoch);
+      last = outcome;
+      if (!outcome.rejected) return outcome;
+
+      logger.warn(
+        { order_item_id: orderItemId, supplier: supplier.name, request_id: outcome.requestId, epoch },
+        'supplier answer refused as invalid, opening a new request epoch',
+      );
+      epoch += 1;
+    }
+
+    return last as SupplierOutcome;
+  }
+
+  /**
+   * One request id, asked until it is answered or the retries run out.
+   *
+   * Reusing the request id across retries is what makes them safe: to the
+   * supplier it is the same request, so at most one code is ever issued for it
+   * however many times the call is repeated.
+   */
+  private async askOnce(
+    orderId: string,
+    orderItemId: string,
+    sku: string,
+    supplier: SupplierGateway,
+    epoch: number,
+  ): Promise<SupplierOutcome> {
     const { uow, supplierRequests, options, metrics, logger } = this.deps;
     const pause = this.deps.sleep ?? ((ms: number) => sleep(ms));
 
-    const epoch = Math.max(1, await supplierRequests.latestEpoch(uow.executor, orderItemId, supplier.name));
     const requestId = supplierRequestId(orderItemId, supplier.name, epoch);
 
     // A code already issued for this request id is reused rather than re-fetched:
@@ -184,10 +240,18 @@ export class DeliverOrderItemUseCase {
         { order_item_id: orderItemId, supplier: supplier.name, request_id: requestId },
         'reusing code from an earlier settled call',
       );
-      return { supplier: supplier.name, requestId, code: known.code, refusedReason: null, indeterminate: false };
+      return {
+        supplier: supplier.name,
+        requestId,
+        code: known.code,
+        refusedReason: null,
+        indeterminate: false,
+        rejected: false,
+      };
     }
 
     let lastIndeterminate = false;
+    let lastRejection: ResponseRejection | 'already_issued' | null = null;
     let refusedReason: string | null = null;
 
     for (let attempt = 1; attempt <= options.maxAttemptsPerSupplier; attempt += 1) {
@@ -221,15 +285,63 @@ export class DeliverOrderItemUseCase {
       metrics.recordSupplierCall(supplier.name, result.kind, result.latencyMs);
 
       if (result.kind === 'issued') {
+        // The supplier said yes. That is not the same as it being true.
+        const rejection = await this.validate(
+          { orderId, orderItemId, supplier: supplier.name, requestId, sku },
+          result,
+        );
+        if (rejection) {
+          lastRejection = rejection;
+          await supplierRequests.recordAttempt(uow.executor, {
+            orderId,
+            orderItemId,
+            supplier: supplier.name,
+            requestId,
+            attemptNo: record.attempts,
+            outcome: 'rejected',
+            latencyMs: result.latencyMs,
+            error: rejection,
+          });
+          // Definitively closed, but NOT as a refusal: the supplier answered and
+          // the answer was unusable. Retrying this id would fetch it again, so
+          // the caller opens a new epoch instead.
+          await supplierRequests.settle(uow.executor, requestId, 'failed_definitive', {
+            failureReason: `rejected:${rejection}`,
+          });
+          metrics.recordRejection(supplier.name, rejection);
+          return {
+            supplier: supplier.name,
+            requestId,
+            code: null,
+            refusedReason: `rejected:${rejection}`,
+            indeterminate: false,
+            rejected: true,
+          };
+        }
+
         await supplierRequests.settle(uow.executor, requestId, 'succeeded', { code: result.code });
-        return { supplier: supplier.name, requestId, code: result.code, refusedReason: null, indeterminate: false };
+        return {
+          supplier: supplier.name,
+          requestId,
+          code: result.code,
+          refusedReason: null,
+          indeterminate: false,
+          rejected: false,
+        };
       }
 
       if (result.kind === 'refused') {
         // The supplier answered. Nothing was issued, so there is nothing to
         // reconcile and the fallback can be tried immediately.
         await supplierRequests.settle(uow.executor, requestId, 'failed_definitive', { failureReason: result.reason });
-        return { supplier: supplier.name, requestId, code: null, refusedReason: result.reason, indeterminate: false };
+        return {
+          supplier: supplier.name,
+          requestId,
+          code: null,
+          refusedReason: result.reason,
+          indeterminate: false,
+          rejected: false,
+        };
       }
 
       // Indeterminate. Record it as such and ask the same question again.
@@ -243,7 +355,106 @@ export class DeliverOrderItemUseCase {
       }
     }
 
-    return { supplier: supplier.name, requestId, code: null, refusedReason, indeterminate: lastIndeterminate };
+    return {
+      supplier: supplier.name,
+      requestId,
+      code: null,
+      refusedReason,
+      indeterminate: lastIndeterminate,
+      rejected: lastRejection !== null && !lastIndeterminate,
+    };
+  }
+
+  /**
+   * Decides whether a "success" from the supplier can be believed.
+   *
+   * Two checks, and they answer different kinds of question.
+   *
+   * The first is about the RESPONSE and is pure: does it name the request we
+   * made, and is the code for the product we asked for. A supplier that answers
+   * about a different request id, or hands over a key from another SKU's pool,
+   * has said something self evidently wrong and no lookup is needed to know it.
+   *
+   * The second is about the WORLD and can only be settled by the database:
+   * has this code already been promised to somebody. That is the one that
+   * catches a silent duplicate, and it has to be a claim rather than a check,
+   * because a check would go stale between asking and acting — two lines racing
+   * on the same duplicated code would both look up, both see nothing, and both
+   * deliver it. The primary key on issued_codes.code makes exactly one of them
+   * win.
+   *
+   * A rejected code is recorded in quarantine and NOT written off as shrinkage.
+   * Shrinkage means stock that was consumed with no sale behind it; a code we
+   * were never entitled to was not our stock, and charging ourselves for it
+   * would inflate the loss with something that never happened. The discrepancy
+   * is visible in the reconciliation report instead, which is where a human
+   * looking for a misbehaving supplier would go.
+   */
+  private async validate(
+    context: { orderId: string; orderItemId: string; supplier: string; requestId: string; sku: string },
+    result: Extract<SupplierResult, { kind: 'issued' }>,
+  ): Promise<ResponseRejection | 'already_issued' | null> {
+    const { uow, issuedCodes, logger } = this.deps;
+
+    const malformed = rejectSupplierResponse(
+      { requestId: result.requestId, sku: result.sku, code: result.code },
+      { requestId: context.requestId, sku: context.sku },
+    );
+
+    const rejection =
+      malformed ??
+      // The claim. Not a lookup: this has to be the write that decides.
+      ((await uow.withTransaction((tx) =>
+        issuedCodes.claim(tx, {
+          code: result.code,
+          supplier: context.supplier,
+          requestId: context.requestId,
+          orderItemId: context.orderItemId,
+          orderId: context.orderId,
+          // Provisional. The code is now spoken for by this line, and finalise
+          // promotes it to `delivered` once the delivery row is actually
+          // written. If delivery then loses to a concurrent winner, the code
+          // becomes an orphan — but it can never become somebody else's.
+          disposition: 'delivered',
+          reason: null,
+        }),
+      ))
+        ? null
+        : 'already_issued');
+
+    if (!rejection) return null;
+
+    // Quarantine the code so it can never be handed to anybody, including by a
+    // later attempt on this same line. `already_issued` is the exception: the
+    // code is legitimately registered to somebody else and must keep pointing at
+    // them, so there is nothing to record beyond the attempt itself.
+    if (rejection !== 'already_issued') {
+      await uow.withTransaction((tx) =>
+        issuedCodes.claim(tx, {
+          code: result.code,
+          supplier: context.supplier,
+          requestId: context.requestId,
+          orderItemId: null,
+          orderId: null,
+          disposition: 'quarantined',
+          reason: rejection,
+        }),
+      );
+    }
+
+    logger.error(
+      {
+        order_item_id: context.orderItemId,
+        supplier: context.supplier,
+        request_id: context.requestId,
+        echoed_request_id: result.requestId,
+        echoed_sku: result.sku,
+        expected_sku: context.sku,
+        rejection,
+      },
+      'supplier returned a code we cannot accept',
+    );
+    return rejection;
   }
 
   /**
@@ -257,7 +468,7 @@ export class DeliverOrderItemUseCase {
     winner: SupplierOutcome,
     outcomes: readonly SupplierOutcome[],
   ): Promise<DeliverOrderItemResult> {
-    const { uow, orderItems, products, deliveries, ledger, metrics, logger } = this.deps;
+    const { uow, orderItems, products, deliveries, issuedCodes, ledger, metrics, logger } = this.deps;
     const code = winner.code;
     if (!code) throw new Error('finalise called without a code');
 
@@ -286,6 +497,12 @@ export class DeliverOrderItemUseCase {
           code,
           note: 'line was already delivered when this code arrived',
         });
+        // The registry already holds this code for us, provisionally as a
+        // delivery. It is not one, so it is corrected to what it actually is:
+        // stock consumed with no sale behind it. It stays OURS either way —
+        // releasing it would put a code a supplier already spent back into
+        // circulation.
+        await issuedCodes.reclassify(tx, code, 'orphan', 'line was already delivered');
         await ledger.append(
           tx,
           orphanIssuanceEntries({
@@ -362,7 +579,7 @@ export class DeliverOrderItemUseCase {
     const everyRefusalIsStock =
       outcomes.length > 0 &&
       outcomes.every((outcome) => outcome.refusedReason === 'out_of_stock') &&
-      !outcomes.some((outcome) => outcome.indeterminate);
+      !outcomes.some((outcome) => outcome.indeterminate || outcome.rejected);
 
     const nextStatus = everyRefusalIsStock ? 'out_of_stock' : 'delivery_failed';
     const rounds = await uow.withTransaction(async (tx) => {

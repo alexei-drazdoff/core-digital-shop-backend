@@ -57,6 +57,17 @@ export function createMetrics(): AppMetrics {
     registers: [registry],
   });
 
+  // The signal that a supplier is not merely unreliable but dishonest. A rising
+  // rate here is qualitatively different from a rising failure rate: retries
+  // cannot fix it, and every one of these was a code somebody tried to sell us
+  // twice.
+  const rejections = new Counter({
+    name: 'supplier_rejected_responses_total',
+    help: 'Supplier answers refused as invalid, by reason',
+    labelNames: ['supplier', 'reason'] as const,
+    registers: [registry],
+  });
+
   const paymentEvents = new Counter({
     name: 'payment_events_total',
     help: 'Payment webhook events by outcome',
@@ -85,6 +96,9 @@ export function createMetrics(): AppMetrics {
     },
     recordOrphan(supplier) {
       orphans.inc({ supplier });
+    },
+    recordRejection(supplier, reason) {
+      rejections.inc({ supplier, reason });
     },
     recordPaymentEvent(outcome) {
       paymentEvents.inc({ outcome });

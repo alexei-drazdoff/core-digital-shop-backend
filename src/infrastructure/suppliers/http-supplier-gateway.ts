@@ -26,6 +26,9 @@ interface IssueResponseBody {
   status?: string;
   code?: string;
   reason?: string;
+  /** Echoed back by the supplier. Reported verbatim, never substituted. */
+  request_id?: string;
+  sku?: string;
 }
 
 export class HttpSupplierGateway implements SupplierGateway {
@@ -63,7 +66,16 @@ export class HttpSupplierGateway implements SupplierGateway {
 
       if (response.statusCode === 200 && typeof body.code === 'string' && body.code.length > 0) {
         breaker.recordSuccess();
-        return { kind: 'issued', code: body.code, latencyMs };
+        // The echoed fields are passed up EXACTLY as received, including when
+        // they disagree with what was asked. Substituting input.requestId here
+        // would erase the mismatch the caller has to detect.
+        return {
+          kind: 'issued',
+          code: body.code,
+          requestId: typeof body.request_id === 'string' ? body.request_id : '',
+          sku: typeof body.sku === 'string' ? body.sku : null,
+          latencyMs,
+        };
       }
 
       // 4xx is the supplier answering. It looked, and it is not giving us a code.

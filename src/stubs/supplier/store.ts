@@ -35,7 +35,21 @@ export interface ChaosConfig {
   hangMs: number;
   issueBeforeHang: boolean;
   hangBeforeLookup: boolean;
-  forcedOutcome: 'ok' | 'error' | 'timeout' | 'out_of_stock' | null;
+  /**
+   * Overrides the random rates for deterministic tests.
+   *
+   * The last three are the dishonest modes: unlike a timeout or an error, they
+   * are answers with nothing true behind them, and no retry can fix that.
+   */
+  forcedOutcome:
+    | 'ok'
+    | 'error'
+    | 'timeout'
+    | 'out_of_stock'
+    | 'duplicate_code'
+    | 'foreign_code'
+    | 'error_after_issue'
+    | null;
 }
 
 export class SupplierStore {
@@ -173,6 +187,51 @@ export class SupplierStore {
       code: row.code,
       createdAt: row.created_at,
     }));
+  }
+
+  /**
+   * A code that was already issued to a DIFFERENT request.
+   *
+   * Deliberately reads from the issuance table without writing to it. That is
+   * the point: the stub's own constraints (one key per issuance, one code per
+   * supplier) make it structurally incapable of issuing the same key twice
+   * through the honest path, so a supplier that hands back a duplicate has to
+   * bypass its own bookkeeping — which is exactly what it looks like from
+   * outside when a real one does it. Nothing was consumed; a lie was told.
+   *
+   * Returns null when there is nothing to duplicate yet, and the caller falls
+   * back to answering honestly rather than inventing a code, so a test that
+   * asks for this mode too early fails loudly instead of passing vacuously.
+   */
+  async someOtherIssuedCode(exceptRequestId: string): Promise<string | null> {
+    const result = await this.pool.query<{ code: string }>(
+      `SELECT code FROM supplier_stub.issuances
+        WHERE supplier = $1 AND request_id <> $2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [this.supplier, exceptRequestId],
+    );
+    return result.rows[0]?.code ?? null;
+  }
+
+  /**
+   * A code from a different product's pool: somebody else's goods.
+   *
+   * Also read only. The key stays `available`, so this is not stock being
+   * consumed, it is the supplier naming a code it has no right to give us for
+   * this order. Answering with it would hand the customer a key for a product
+   * they did not buy, and later hand the same key to whoever actually buys it.
+   */
+  async someForeignCode(sku: string): Promise<{ code: string; sku: string } | null> {
+    const result = await this.pool.query<{ code: string; sku: string }>(
+      `SELECT code, sku FROM supplier_stub.keys
+        WHERE supplier = $1 AND sku <> $2
+        ORDER BY id
+        LIMIT 1`,
+      [this.supplier, sku],
+    );
+    const row = result.rows[0];
+    return row ? { code: row.code, sku: row.sku } : null;
   }
 
   async stock(): Promise<Array<{ sku: string; available: number }>> {

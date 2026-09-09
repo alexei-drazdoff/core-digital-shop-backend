@@ -39,6 +39,7 @@ export function registerAdminRoutes(app: AppServer, container: Container): void 
       unsettled_orders: report.unsettledOrders,
       unresolved_supplier_requests: report.unresolvedSupplierRequests,
       orphan_issuances: report.orphanIssuances,
+      quarantined_codes: report.quarantinedCodes,
       deferred_payment_events: report.deferredPaymentEvents,
       dead_jobs: report.deadJobs,
       ledger_imbalances: report.ledgerImbalances,
@@ -200,6 +201,19 @@ export function registerAdminRoutes(app: AppServer, container: Container): void 
     const recovered = await useCases.recoverStuckOrders.execute();
     return { supplier: supplierName, sku: body.sku, added: body.count, synced, recovered };
   });
+
+  /**
+   * Runs the supplier discrepancy sweep on demand.
+   *
+   * Only enqueues reconciliations, so it is safe to poke: the actual chasing
+   * happens on the worker, at the worker's pace.
+   */
+  app.post('/admin/reconcile-suppliers', async () => useCases.sweepSupplierDiscrepancies.execute());
+
+  /** Codes a supplier offered that were refused as invalid, newest first. */
+  app.get('/admin/quarantined-codes', async () => ({
+    items: await repositories.issuedCodes.quarantined(pool, 100),
+  }));
 
   app.post('/admin/sync-stock', async () => useCases.syncStock.execute());
 }

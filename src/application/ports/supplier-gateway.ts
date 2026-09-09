@@ -8,7 +8,21 @@
  * do about an unknown rather than assuming the worst.
  */
 export type SupplierResult =
-  | { readonly kind: 'issued'; readonly code: string; readonly latencyMs: number }
+  | {
+      readonly kind: 'issued';
+      readonly code: string;
+      /**
+       * What the supplier claims to be answering about.
+       *
+       * Carried through rather than assumed, because at this stage the supplier
+       * may be answering about something else entirely, and the caller is the
+       * only party in a position to notice. `sku` is null when the supplier did
+       * not say — silence is not a contradiction.
+       */
+      readonly requestId: string;
+      readonly sku: string | null;
+      readonly latencyMs: number;
+    }
   /** The supplier answered and said no. Nothing was issued, so failing over is safe. */
   | { readonly kind: 'refused'; readonly reason: string; readonly latencyMs: number }
   /** Timeout, connection error, or an open circuit. The supplier MAY have issued. */

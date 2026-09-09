@@ -17,6 +17,7 @@ import { PgOrderRepository } from '../infrastructure/db/repositories/order-repos
 import { PgOrderItemRepository } from '../infrastructure/db/repositories/order-item-repository.js';
 import { PgPaymentEventRepository } from '../infrastructure/db/repositories/payment-event-repository.js';
 import { PgDeliveryRepository, PgSupplierRequestRepository } from '../infrastructure/db/repositories/delivery-repository.js';
+import { PgIssuedCodeRepository } from '../infrastructure/db/repositories/issued-code-repository.js';
 import { PgRefundRepository } from '../infrastructure/db/repositories/refund-repository.js';
 import { PgLedgerRepository } from '../infrastructure/db/repositories/ledger-repository.js';
 import { PgIdempotencyRepository } from '../infrastructure/db/repositories/idempotency-repository.js';
@@ -33,6 +34,7 @@ import { DeliverOrderItemUseCase } from '../application/use-cases/deliver-order-
 import { SettleOrderUseCase } from '../application/use-cases/settle-order.js';
 import { ReconcileSupplierRequestUseCase } from '../application/use-cases/reconcile-supplier-request.js';
 import { RecoverStuckOrdersUseCase } from '../application/use-cases/recover-stuck-orders.js';
+import { SweepSupplierDiscrepanciesUseCase } from '../application/use-cases/sweep-supplier-discrepancies.js';
 import { SyncStockUseCase } from '../application/use-cases/sync-stock.js';
 import { SUPPLIER_A, SUPPLIER_B } from '../shared/constants.js';
 
@@ -51,6 +53,7 @@ export interface Container {
     paymentEvents: PgPaymentEventRepository;
     deliveries: PgDeliveryRepository;
     supplierRequests: PgSupplierRequestRepository;
+    issuedCodes: PgIssuedCodeRepository;
     refunds: PgRefundRepository;
     ledger: PgLedgerRepository;
     idempotency: PgIdempotencyRepository;
@@ -64,6 +67,7 @@ export interface Container {
     settleOrder: SettleOrderUseCase;
     reconcileSupplierRequest: ReconcileSupplierRequestUseCase;
     recoverStuckOrders: RecoverStuckOrdersUseCase;
+    sweepSupplierDiscrepancies: SweepSupplierDiscrepanciesUseCase;
     syncStock: SyncStockUseCase;
   };
   shutdown(): Promise<void>;
@@ -91,6 +95,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
   const paymentEvents = new PgPaymentEventRepository();
   const deliveries = new PgDeliveryRepository();
   const supplierRequests = new PgSupplierRequestRepository();
+  const issuedCodes = new PgIssuedCodeRepository();
   const refunds = new PgRefundRepository();
   const ledger = new PgLedgerRepository();
   const idempotency = new PgIdempotencyRepository();
@@ -147,6 +152,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     products,
     deliveries,
     supplierRequests,
+    issuedCodes,
     ledger,
     queue,
     suppliers,
@@ -156,6 +162,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
       maxAttemptsPerSupplier: config.SUPPLIER_MAX_ATTEMPTS,
       backoffBaseMs: config.SUPPLIER_BACKOFF_BASE_MS,
       backoffMaxMs: config.SUPPLIER_BACKOFF_MAX_MS,
+      maxEpochsPerSupplier: config.SUPPLIER_MAX_EPOCHS,
     },
   });
 
@@ -175,6 +182,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     products,
     deliveries,
     supplierRequests,
+    issuedCodes,
     ledger,
     queue,
     suppliers,
@@ -194,6 +202,15 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     maxDeliveryRounds: config.ITEM_MAX_DELIVERY_ROUNDS,
   });
 
+  const sweepSupplierDiscrepancies = new SweepSupplierDiscrepanciesUseCase({
+    uow,
+    supplierRequests,
+    queue,
+    clock,
+    logger,
+    staleAfterMs: config.STUCK_ORDER_AFTER_MS,
+  });
+
   const syncStock = new SyncStockUseCase({ uow, products, suppliers, logger });
 
   return {
@@ -211,6 +228,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
       paymentEvents,
       deliveries,
       supplierRequests,
+      issuedCodes,
       refunds,
       ledger,
       idempotency,
@@ -224,6 +242,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
       settleOrder,
       reconcileSupplierRequest,
       recoverStuckOrders,
+      sweepSupplierDiscrepancies,
       syncStock,
     },
     async shutdown() {
