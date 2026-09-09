@@ -487,9 +487,14 @@ export class DeliverOrderItemUseCase {
     if (!rejection) return null;
 
     // Quarantine the code so it can never be handed to anybody, including by a
-    // later attempt on this same line. `already_issued` is the exception: the
-    // code is legitimately registered to somebody else and must keep pointing at
-    // them, so there is nothing to record beyond the attempt itself.
+    // later attempt on this same line.
+    //
+    // Two cases are deliberately left alone. `already_issued` means the code is
+    // legitimately registered to somebody else and must keep pointing at them.
+    // And a claim that loses here is one whose code we already hold for another
+    // purpose — the return value is ignored on purpose, because the existing
+    // registration is the truthful one and must not be overwritten by a
+    // supplier's later mistake with the same code.
     if (rejection !== 'already_issued') {
       await uow.withTransaction((tx) =>
         issuedCodes.claim(tx, {

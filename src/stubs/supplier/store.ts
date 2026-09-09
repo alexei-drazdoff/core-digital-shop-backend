@@ -224,8 +224,11 @@ export class SupplierStore {
    */
   async someForeignCode(sku: string): Promise<{ code: string; sku: string } | null> {
     const result = await this.pool.query<{ code: string; sku: string }>(
+      // An AVAILABLE key, so the offered code is one nobody owns yet. That is
+      // the interesting shape: a code the caller cannot dismiss as "already
+      // sold" and has to reject purely because it is for the wrong product.
       `SELECT code, sku FROM supplier_stub.keys
-        WHERE supplier = $1 AND sku <> $2
+        WHERE supplier = $1 AND sku <> $2 AND state = 'available'
         ORDER BY id
         LIMIT 1`,
       [this.supplier, sku],

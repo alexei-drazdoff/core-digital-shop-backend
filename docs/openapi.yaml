@@ -387,6 +387,262 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /admin/money:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Сходимость денег по каждому оплаченному заказу
+      description: |
+        Отвечает на «сходятся ли деньги» арифметикой, а не утверждением: для
+        каждого заказа читает, что оплачено, чего стоят выданные позиции и что
+        возвращено, прямо из таблиц.
+
+        Считается из `order_items`, `deliveries` и `refunds` — то есть из
+        ТОВАРОВ, а не из журнала, — поэтому вместе с `/admin/ledger/balance` это
+        два независимых мнения об одних и тех же фактах. Отчёт, доверяющий тому
+        же коду, который мог ошибиться, не отчёт.
+      responses:
+        '200':
+          description: Всё сходится.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MoneyReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Есть заказы, у которых суммы не сходятся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MoneyReport'
+
+  /admin/queue/progress:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Прогресс очереди и остаток квоты поставщиков
+      description: |
+        Намеренно показывает очередь и товары ОТДЕЛЬНО: во время всплеска это
+        разные вопросы. Бэклог при нуле мёртвых задач и растущем счётчике
+        выданных — это система, правильно поглощающая пик, и две цифры рядом
+        делают это видимым, а не тревожным.
+      responses:
+        '200':
+          description: Состояние очереди.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueProgress'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/quarantined-codes:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Коды, отбракованные у поставщика
+      description: |
+        Коды, которые поставщик предложил, а система отказалась принять: дубль
+        уже выданного, код от другого товара, ответ не про тот запрос. Проводки
+        по ним не делается — `shrinkage` означает потреблённый склад без продажи,
+        а код, на который у нас никогда не было прав, нашим складом не был.
+      responses:
+        '200':
+          description: Список карантина, новые сверху.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/QuarantinedCode'
+                required: [items]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/orders/{id}/settle:
+    post:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Пересчитать итог заказа по его позициям
+      description: |
+        Идемпотентно: возврат пишется через `ON CONFLICT (order_item_id) DO
+        NOTHING`, а статус выводится из позиций, поэтому пятьдесят прогонов дают
+        один возврат и один результат.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Итог заказа.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettlementReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Заказ не найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/reconcile-suppliers:
+    post:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Разобрать повисшие расхождения с поставщиками
+      description: |
+        Находит обращения, судьба которых неизвестна, и ставит по ним сверку —
+        никто не называет ей номер запроса. Путь выдачи планирует сверку сам,
+        когда сдаётся на неотвеченном вызове; эта свёртка нужна для случаев,
+        когда та постановка не пережила: воркер умер, задача умерла, процесс убит
+        при `in_flight`. Каждый такой случай — утверждение «поставщик мог
+        потратить на нас ключ», которое ничто не доводит до конца.
+
+        Только ставит задачи, к поставщикам не ходит, поэтому дёргать безопасно.
+      responses:
+        '200':
+          description: Сколько нашла и сколько поставила.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unresolved: { type: integer }
+                  scheduled: { type: integer }
+                required: [unresolved, scheduled]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/orders/{id}/at:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Состояние заказа и денег на прошлый момент
+      description: |
+        Восстанавливается проигрыванием записанных фактов, а не чтением
+        сегодняшней строки задом наперёд: сегодняшняя строка говорит, что верно
+        СЕЙЧАС, и не помнит, что была другой.
+
+        Свёртка идёт по `recorded_at` — когда мы УЗНАЛИ факт, — а не по
+        `occurred_at`. Вебхук, пришедший в 12:05 о платеже в 11:55, не был нам
+        известен в 12:00, и ответ по `occurred_at` выдал бы историю, задним
+        числом знающую будущее.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: ts
+          in: query
+          required: true
+          description: Момент времени, ISO 8601 со смещением.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: |
+            Снимок состояния. Пустой `status` означает, что заказа тогда ещё не
+            было, — это ответ, а не отсутствие ответа.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSnapshot'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: У заказа нет истории.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/orders/{id}/history:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Полная история заказа
+      description: |
+        Только дополняется. UPDATE и DELETE по `order_events` отбиваются
+        триггером базы: таблица, которую никто не UPDATE-ит, это не append-only
+        журнал, это таблица, которой повезло.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: События по возрастанию времени записи.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id: { type: string }
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderEvent'
+                required: [order_id, events]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: У заказа нет истории.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/reports/period:
+    get:
+      tags: [admin]
+      security: [{ adminToken: [] }]
+      summary: Итоги за период
+      description: |
+        Считается из журнала по `created_at`. Журнал append-only и не датируется
+        задним числом, поэтому повторный отчёт по закрытому периоду навсегда
+        вернёт те же цифры — и это и есть содержание требования, а не то, что
+        арифметика работает.
+
+        Границы полуоткрытые `[from, to)`, чтобы соседние периоды стыковались без
+        двойного счёта: последняя миллисекунда марта не должна быть ещё и первой
+        миллисекундой апреля.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Итоги сходятся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeriodReport'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Движение денег не совпало с разницей захваченного и возвращённого.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeriodReport'
+
   /admin/orders/{id}/redeliver:
     post:
       tags: [admin]
@@ -592,6 +848,13 @@ components:
       type: string
       enum: [topup, key, subscription, giftcard]
 
+    OrderItemStatus:
+      type: string
+      description: |
+        Жизненный цикл ПОЗИЦИИ, единицы выдачи. Намеренно зеркалит статусы заказа
+        минус платёжные: те принадлежат корзине целиком.
+      enum: [pending, delivering, delivered, out_of_stock, delivery_failed, refunded]
+
     OrderStatus:
       type: string
       enum:
@@ -599,6 +862,8 @@ components:
         - paid
         - delivering
         - delivered
+        - partially_delivered
+        - refunded
         - payment_failed
         - out_of_stock
         - delivery_failed
@@ -647,13 +912,42 @@ components:
               type: boolean
           required: [is_active]
 
-    CreateOrderRequest:
+    OrderLine:
       type: object
       properties:
         sku:
           type: string
           minLength: 1
           maxLength: 64
+        qty:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 1
+          description: |
+            Каждая единица становится ОТДЕЛЬНОЙ позицией: одна единица это один
+            код от одного поставщика с одним request_id. Свернуть две единицы в
+            количество значило бы сделать «одна из них не выдалась» невыразимым.
+      required: [sku]
+
+    CreateOrderRequest:
+      type: object
+      description: |
+        Ровно одно из `sku` или `items`. Форма с `sku` это контракт первого
+        этапа, она продолжает работать; `items` добавлена вторым этапом.
+        Запрос, указавший обе, отклоняется: у него нет очевидного смысла, а
+        угадывать хуже, чем отказать.
+      properties:
+        sku:
+          type: string
+          minLength: 1
+          maxLength: 64
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/OrderLine'
         customer_ref:
           type: string
           maxLength: 200
@@ -665,9 +959,11 @@ components:
             стороне можно было сообщить id до того, как строка заказа появится
             здесь, — именно это делает воспроизводимым сценарий с ранним вебхуком.
             Валидируется, а не принимается на веру.
-      required: [sku]
       example:
-        sku: KEY-GTA5
+        items:
+          - sku: KEY-GTA5
+          - sku: STEAM-TOPUP-500
+            qty: 2
         customer_ref: user-42
 
     OrderSummary:
@@ -677,16 +973,105 @@ components:
           type: string
         sku:
           type: string
+          nullable: true
+          description: |
+            Заполнен только для однопозиционного заказа, ради совместимости с
+            клиентами первого этапа. У корзины нет одного SKU, и утверждать
+            обратное было бы хуже, чем не отвечать.
         amount:
           type: integer
+          description: Сумма позиций. Никогда не приходит от клиента.
         currency:
           type: string
         status:
           $ref: '#/components/schemas/OrderStatus'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemSummary'
         created_at:
           type: string
           format: date-time
-      required: [order_id, sku, amount, currency, status, created_at]
+      required: [order_id, amount, currency, status, items, created_at]
+
+    OrderItemSummary:
+      type: object
+      properties:
+        order_item_id:
+          type: string
+        line_no:
+          type: integer
+        sku:
+          type: string
+        price:
+          type: integer
+        status:
+          $ref: '#/components/schemas/OrderItemStatus'
+      required: [order_item_id, line_no, sku, price, status]
+
+    OrderMoney:
+      type: object
+      description: |
+        Инвариант задания, посчитанный для этого заказа:
+        `paid = delivered + refunded + unresolved`. У завершённого заказа
+        `unresolved` равен нулю, и утверждение сворачивается ровно в
+        «оплачено = выдано + возвращено».
+      properties:
+        paid:
+          type: integer
+        delivered:
+          type: integer
+          description: Сумма цен позиций, которые покупатель действительно получил.
+        refunded:
+          type: integer
+        unresolved:
+          type: integer
+          description: Оплачено, но ещё в работе.
+      required: [paid, delivered, refunded, unresolved]
+
+    Refund:
+      type: object
+      properties:
+        amount:
+          type: integer
+        reason:
+          type: string
+          enum: [out_of_stock, delivery_failed]
+        refunded_at:
+          type: string
+          format: date-time
+      required: [amount, reason, refunded_at]
+
+    OrderItemDetail:
+      type: object
+      properties:
+        order_item_id:
+          type: string
+        line_no:
+          type: integer
+        sku:
+          type: string
+        price:
+          type: integer
+        status:
+          $ref: '#/components/schemas/OrderItemStatus'
+        rounds:
+          type: integer
+          description: |
+            Потраченные полные проходы по всем поставщикам. Раунд это проход, а не
+            HTTP-попытка: повторы внутри одного поставщика это обработка ловушки
+            таймаута, и считать их значило бы принимать медленного поставщика за
+            непроходимую позицию. Бюджет конечен, иначе «за что не смогли, деньги
+            возвращаются» было бы неверно.
+        delivery:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Delivery'
+        refund:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Refund'
+      required: [order_item_id, line_no, sku, price, status, rounds, delivery, refund]
 
     OrderDetail:
       type: object
@@ -714,23 +1099,33 @@ components:
           nullable: true
         delivery:
           nullable: true
-          description: Появляется только после того, как выдача зафиксирована в базе.
+          description: |
+            Форма первого этапа, заполняется только для однопозиционного заказа.
+            У корзины нет одной выдачи, поэтому здесь `null`, а читать нужно
+            `items` — единственный честный ответ, когда три кода пришли от трёх
+            поставщиков и один не пришёл вовсе.
           allOf:
             - $ref: '#/components/schemas/Delivery'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemDetail'
+        money:
+          $ref: '#/components/schemas/OrderMoney'
         supplier_requests:
           type: array
           items:
             $ref: '#/components/schemas/SupplierRequestSummary'
       required:
         - order_id
-        - sku
         - amount
         - currency
         - status
         - created_at
         - paid_at
         - delivered_at
-        - delivery
+        - items
+        - money
         - supplier_requests
 
     Delivery:
@@ -749,19 +1144,30 @@ components:
     SupplierRequestSummary:
       type: object
       properties:
+        order_item_id:
+          type: string
         supplier:
           type: string
         request_id:
           type: string
           description: |
-            Выводится из пары (заказ, поставщик), а не генерируется на каждую
-            попытку. Поэтому повтор после таймаута приходит к поставщику с тем же
-            идентификатором и получает тот же код, а не новый.
+            Выводится из тройки (позиция, поставщик, эпоха), а не генерируется на
+            каждую попытку. Поэтому повтор после таймаута приходит к поставщику с
+            тем же идентификатором и получает тот же код, а не новый.
+        epoch:
+          type: integer
+          description: |
+            Растёт ТОЛЬКО когда ответ поставщика отбракован как невалидный
+            (дубль чужого кода, код от другого товара). Никогда на таймаут и
+            никогда на отказ: у отбракованного ответа он ЕСТЬ и он неверен, так
+            что повтор того же request_id вечно возвращал бы ту же ложь. На
+            таймаут эпоха не растёт, иначе ловушка таймаута покупала бы вторые
+            коды.
         state:
           $ref: '#/components/schemas/SupplierRequestState'
         attempts:
           type: integer
-      required: [supplier, request_id, state, attempts]
+      required: [order_item_id, supplier, request_id, epoch, state, attempts]
 
     PaymentWebhook:
       type: object
@@ -914,6 +1320,34 @@ components:
           description: Задачи, исчерпавшие повторы. Видны, а не потеряны молча.
           items:
             $ref: '#/components/schemas/ReconciliationRow'
+        double_settled_items:
+          type: array
+          description: |
+            Позиции, которые одновременно выданы И возвращены. Единственный сбой,
+            ломающий «оплачено = выдано + возвращено» при формально сходящихся
+            счетах: и выдача, и возврат по отдельности являются корректной
+            двойной записью, поэтому ни одна сумма по счёту его не поймает.
+            Ограничением таблицы не выражается, поэтому спрашивается напрямую.
+            Всегда должен быть пуст.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        unsettled_orders:
+          type: array
+          description: |
+            Заказы, все позиции которых разрешены, а статус не догнал. Окно между
+            последней выдачей и фиксацией итога реально и открывается на каждом
+            здоровом заказе, поэтому строка появляется здесь, только если
+            просрочена: иначе эндпоинт мигал бы 409 на каждом нормальном заказе.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
+        quarantined_codes:
+          type: array
+          description: |
+            Коды, отбракованные у поставщика. Не влияет на здоровье: плохое
+            поведение поставщика не является болезнью этой системы, она его как
+            раз обнаружила и обработала.
+          items:
+            $ref: '#/components/schemas/ReconciliationRow'
         ledger_imbalances:
           type: array
           items:
@@ -928,9 +1362,191 @@ components:
         - stale_after
         - paid_not_delivered
         - delivered_not_paid
+        - double_settled_items
+        - unsettled_orders
         - unresolved_supplier_requests
         - orphan_issuances
+        - quarantined_codes
         - deferred_payment_events
         - dead_jobs
         - ledger_imbalances
         - ledger_by_account
+
+    MoneyReport:
+      type: object
+      properties:
+        balanced:
+          type: boolean
+        orders_checked:
+          type: integer
+        totals:
+          $ref: '#/components/schemas/OrderMoney'
+        mismatched:
+          type: array
+          description: Заказы, у которых оплаченное не равно сумме выданного, возвращённого и того, что в работе. Всегда должен быть пуст.
+          items:
+            type: object
+            properties:
+              order_id: { type: string }
+              status: { type: string }
+              paid: { type: integer }
+              delivered: { type: integer }
+              refunded: { type: integer }
+              unresolved: { type: integer }
+              settled: { type: boolean }
+      required: [balanced, orders_checked, totals, mismatched]
+
+    QueueProgress:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string }
+              state: { type: string }
+              count: { type: integer }
+              deferrals:
+                type: integer
+                description: |
+                  Сколько раз задачи этого вида возвращались в очередь из-за
+                  нехватки квоты поставщика. Это ожидание, а не отказ: отсрочка
+                  не тратит попытку, поэтому всплеск не может убить задачу.
+              priority: { type: integer }
+        pending_jobs: { type: integer }
+        dead_jobs: { type: integer }
+        items:
+          type: object
+          properties:
+            delivered: { type: integer }
+            refunded: { type: integer }
+            waiting: { type: integer }
+            by_status:
+              type: object
+              additionalProperties: { type: integer }
+          required: [delivered, refunded, waiting, by_status]
+        supplier_capacity:
+          type: array
+          items:
+            type: object
+            properties:
+              supplier: { type: string }
+              tokens: { type: integer }
+              capacity: { type: integer }
+            required: [supplier, tokens, capacity]
+      required: [jobs, pending_jobs, dead_jobs, items, supplier_capacity]
+
+    QuarantinedCode:
+      type: object
+      properties:
+        code: { type: string }
+        supplier: { type: string }
+        requestId: { type: string }
+        disposition:
+          type: string
+          enum: [delivered, orphan, quarantined]
+        reason:
+          type: string
+          nullable: true
+          enum: [request_id_mismatch, sku_mismatch, malformed_code, null]
+        createdAt: { type: string, format: date-time }
+      required: [code, supplier, requestId, disposition]
+
+    SettlementReport:
+      type: object
+      properties:
+        orderId: { type: string }
+        status:
+          type: string
+          nullable: true
+          description: Null, пока часть позиций не разрешена.
+        deliveredMinor: { type: integer }
+        refundedMinor: { type: integer }
+        refundsWritten: { type: integer }
+      required: [orderId, status, deliveredMinor, refundedMinor, refundsWritten]
+
+    OrderEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        type:
+          type: string
+          enum:
+            - order_created
+            - payment_captured
+            - payment_failed
+            - item_delivering
+            - item_delivered
+            - item_refunded
+            - code_quarantined
+            - order_settled
+        order_item_id:
+          type: string
+          nullable: true
+        payload:
+          type: object
+          additionalProperties: true
+        occurred_at:
+          type: string
+          format: date-time
+          description: Когда факт случился в мире.
+        recorded_at:
+          type: string
+          format: date-time
+          description: Когда мы о нём узнали. Восстановление состояния идёт по этому полю.
+      required: [id, type, order_item_id, payload, occurred_at, recorded_at]
+
+    OrderSnapshot:
+      type: object
+      properties:
+        order_id: { type: string }
+        as_of: { type: string, format: date-time }
+        status:
+          type: string
+          nullable: true
+        amount: { type: integer }
+        money:
+          $ref: '#/components/schemas/OrderMoney'
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              order_item_id: { type: string }
+              sku: { type: string }
+              price: { type: integer }
+              status: { type: string }
+              supplier: { type: string, nullable: true }
+              has_code: { type: boolean }
+        events_applied:
+          type: integer
+          description: Сколько фактов было известно к этому моменту.
+        events_total:
+          type: integer
+      required: [order_id, as_of, status, amount, money, items, events_applied, events_total]
+
+    PeriodReport:
+      type: object
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        balanced:
+          type: boolean
+          description: |
+            Настоящая проверка, а не пересказ: движение денег берётся из
+            `psp_cash`, а `captured` и `refunded` — из `revenue` и `refund`. Их
+            совпадение означает, что три независимые суммы по счетам
+            рассказывают одну историю.
+        captured: { type: integer }
+        refunded: { type: integer }
+        net_revenue: { type: integer }
+        cash_movement: { type: integer }
+        orders_paid: { type: integer }
+        items_delivered: { type: integer }
+        items_refunded: { type: integer }
+        by_account:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountBalance'
+      required: [from, to, balanced, captured, refunded, net_revenue, cash_movement]
