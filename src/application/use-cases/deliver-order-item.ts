@@ -36,7 +36,8 @@ import { deliveryCostEntries, orphanIssuanceEntries } from '../../domain/ledger/
 import { backoffDelayMs } from '../retry-policy.js';
 import { settlementJobDedupeKey } from './apply-payment-event.js';
 import type { SupplierGateway, SupplierResult } from '../ports/supplier-gateway.js';
-import type { JobQueue } from '../ports/queue.js';
+import { JOB_PRIORITY, type JobQueue } from '../ports/queue.js';
+import type { SupplierRateLimiter } from '../ports/rate-limiter.js';
 import type {
   DeliveryRepository,
   IssuedCodeRepository,
@@ -54,6 +55,11 @@ export type DeliverOrderItemResult =
   | { readonly kind: 'delivered'; readonly supplier: string; readonly alreadyDelivered: boolean }
   | { readonly kind: 'out_of_stock' }
   | { readonly kind: 'failed'; readonly reason: string }
+  /**
+   * Every supplier is at its rate limit. Nothing was attempted and nothing is
+   * wrong: the line goes back on the queue and waits for capacity.
+   */
+  | { readonly kind: 'rate_limited'; readonly retryAfter: Date }
   /** Nothing to do: the line is not in a state that owes the customer a code. */
   | { readonly kind: 'not_applicable'; readonly status: string };
 
@@ -65,6 +71,14 @@ interface SupplierOutcome {
   readonly indeterminate: boolean;
   /** True when every answer this supplier gave was refused as invalid. */
   readonly rejected: boolean;
+  /**
+   * When set, this supplier was NOT asked: it had no capacity to spare.
+   *
+   * Kept distinct from every failure, because it is not one. A supplier that was
+   * never asked has not refused, has not timed out, and has told us nothing
+   * about whether it could have served the line.
+   */
+  readonly rateLimitedUntil: Date | null;
 }
 
 export interface DeliverOrderItemOptions {
@@ -95,6 +109,7 @@ export class DeliverOrderItemUseCase {
       issuedCodes: IssuedCodeRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
+      rateLimiter: SupplierRateLimiter;
       /** Ordered: the first is primary, the rest are fallbacks. */
       suppliers: readonly SupplierGateway[];
       options: DeliverOrderItemOptions;
@@ -138,7 +153,28 @@ export class DeliverOrderItemUseCase {
     }
 
     const outcomes: SupplierOutcome[] = [];
+    let soonestRetry: Date | undefined;
+
     for (const supplier of this.deps.suppliers) {
+      // Capacity is taken BEFORE the call and never given back, which is the
+      // conservative direction: a token spent on a call that then failed is a
+      // request the supplier really did receive, and pretending otherwise is how
+      // a retry storm exceeds the limit it is trying to respect.
+      const capacity = await this.deps.rateLimiter.tryConsume(uow.executor, supplier.name);
+      if (!capacity.allowed) {
+        // The soonest of the suppliers, so the line comes back as soon as ANY
+        // of them can serve it rather than waiting out the slowest.
+        soonestRetry =
+          soonestRetry !== undefined && soonestRetry.getTime() < capacity.retryAfter.getTime()
+            ? soonestRetry
+            : capacity.retryAfter;
+        this.deps.logger.debug(
+          { order_item_id: orderItemId, supplier: supplier.name, retry_after: capacity.retryAfter },
+          'supplier is at its rate limit, skipping it for now',
+        );
+        continue;
+      }
+
       const outcome = await this.trySupplier(item.orderId, orderItemId, item.sku, supplier);
       outcomes.push(outcome);
 
@@ -157,6 +193,23 @@ export class DeliverOrderItemUseCase {
           'supplier outcome still unknown after retries, failing over and scheduling reconciliation',
         );
       }
+    }
+
+    // At least one supplier was never asked, and no code came from the ones that
+    // were. The line goes back exactly as it was — no round spent, no failure
+    // recorded, no attempt charged — and waits.
+    //
+    // The condition is "ANY supplier was throttled", not "all of them were, and
+    // that is the difference between a correct system and one that refunds
+    // paying customers because a supplier was busy. Charging a round here would
+    // spend the line's budget on a question that was never put to the supplier
+    // that might have answered yes, and three of those end in a refund.
+    //
+    // Releasing the claim first matters: leaving the line in `delivering` would
+    // make it look owned by a worker that is not working on it.
+    if (soonestRetry !== undefined) {
+      await uow.withTransaction((tx) => orderItems.transition(tx, orderItemId, 'delivering', item.status));
+      return { kind: 'rate_limited', retryAfter: soonestRetry };
     }
 
     return this.recordNoDelivery(item.orderId, orderItemId, outcomes);
@@ -196,6 +249,8 @@ export class DeliverOrderItemUseCase {
     for (let round = 1; round <= options.maxEpochsPerSupplier; round += 1) {
       const outcome = await this.askOnce(orderId, orderItemId, sku, supplier, epoch);
       last = outcome;
+      // No capacity is not a bad answer, so it does not earn a new epoch.
+      if (outcome.rateLimitedUntil) return outcome;
       if (!outcome.rejected) return outcome;
 
       logger.warn(
@@ -247,6 +302,7 @@ export class DeliverOrderItemUseCase {
         refusedReason: null,
         indeterminate: false,
         rejected: false,
+        rateLimitedUntil: null,
       };
     }
 
@@ -316,6 +372,7 @@ export class DeliverOrderItemUseCase {
             refusedReason: `rejected:${rejection}`,
             indeterminate: false,
             rejected: true,
+            rateLimitedUntil: null,
           };
         }
 
@@ -327,6 +384,7 @@ export class DeliverOrderItemUseCase {
           refusedReason: null,
           indeterminate: false,
           rejected: false,
+          rateLimitedUntil: null,
         };
       }
 
@@ -341,6 +399,7 @@ export class DeliverOrderItemUseCase {
           refusedReason: result.reason,
           indeterminate: false,
           rejected: false,
+          rateLimitedUntil: null,
         };
       }
 
@@ -362,6 +421,7 @@ export class DeliverOrderItemUseCase {
       refusedReason,
       indeterminate: lastIndeterminate,
       rejected: lastRejection !== null && !lastIndeterminate,
+      rateLimitedUntil: null,
     };
   }
 
@@ -629,6 +689,7 @@ export class DeliverOrderItemUseCase {
         kind: 'settle_order',
         dedupeKey: settlementJobDedupeKey(orderId),
         payload: { orderId },
+        priority: JOB_PRIORITY.DEFAULT,
       }),
     );
   }

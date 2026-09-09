@@ -23,6 +23,7 @@ import { orphanIssuanceEntries, deliveryCostEntries } from '../../domain/ledger/
 import { settlementJobDedupeKey } from './apply-payment-event.js';
 import type { SupplierGateway } from '../ports/supplier-gateway.js';
 import type { JobQueue } from '../ports/queue.js';
+import type { SupplierRateLimiter } from '../ports/rate-limiter.js';
 import type {
   DeliveryRepository,
   IssuedCodeRepository,
@@ -44,7 +45,14 @@ export type ReconcileResult =
   /** A code was recovered but the line was already served, so it is written off. */
   | { readonly kind: 'recovered_as_orphan' }
   /** Still unreachable. Left unsettled so a later run tries again. */
-  | { readonly kind: 'still_unknown' };
+  | { readonly kind: 'still_unknown' }
+  /**
+   * No supplier capacity to spare for the question.
+   *
+   * Distinct from `still_unknown`, which means we asked and got nothing. Here
+   * we did not ask, so the claim is untouched and the job simply waits.
+   */
+  | { readonly kind: 'rate_limited'; readonly retryAfter: Date };
 
 export class ReconcileSupplierRequestUseCase {
   constructor(
@@ -57,6 +65,7 @@ export class ReconcileSupplierRequestUseCase {
       issuedCodes: IssuedCodeRepository;
       ledger: LedgerRepository;
       queue: JobQueue;
+      rateLimiter: SupplierRateLimiter;
       suppliers: readonly SupplierGateway[];
       metrics: DeliveryMetrics;
       logger: Logger;
@@ -80,6 +89,20 @@ export class ReconcileSupplierRequestUseCase {
     if (!code) {
       const gateway = suppliers.find((supplier) => supplier.name === record.supplier);
       if (!gateway) return { kind: 'nothing_to_do', reason: 'unknown_supplier' };
+
+      // Reconciliation is a real HTTP request and the supplier's limit counts
+      // real HTTP requests. Skipping the limiter here would be the worst place
+      // to do it: the discrepancy sweep can enqueue a whole batch at once, and
+      // it fires precisely when a supplier is already unwell — turning the
+      // recovery mechanism into the thing that keeps it down.
+      const capacity = await this.deps.rateLimiter.tryConsume(uow.executor, record.supplier);
+      if (!capacity.allowed) {
+        logger.debug(
+          { request_id: requestId, supplier: record.supplier, retry_after: capacity.retryAfter },
+          'no supplier capacity to reconcile with, claim left open',
+        );
+        return { kind: 'rate_limited', retryAfter: capacity.retryAfter };
+      }
 
       const result = await gateway.issue({
         requestId,

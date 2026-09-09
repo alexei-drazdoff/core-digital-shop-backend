@@ -19,7 +19,7 @@
  * duplicate work onto a line that is already being retried.
  */
 import { deliveryJobDedupeKey, settlementJobDedupeKey } from './apply-payment-event.js';
-import type { JobQueue } from '../ports/queue.js';
+import { JOB_PRIORITY, type JobQueue } from '../ports/queue.js';
 import type { OrderItemRepository, OrderRepository, PaymentEventRepository } from '../ports/repositories.js';
 import type { Clock } from '../ports/clock.js';
 import type { UnitOfWork } from '../../infrastructure/db/unit-of-work.js';
@@ -81,6 +81,10 @@ export class RecoverStuckOrdersUseCase {
           kind: 'deliver_order_item',
           dedupeKey: deliveryJobDedupeKey(item.id),
           payload: { orderItemId: item.id },
+          // Paid, so it outranks everything unpaid — but below a first attempt,
+          // because a customer who has not been tried yet is worse off than one
+          // whose line is being retried.
+          priority: JOB_PRIORITY.PAID_RETRY,
         }),
       );
       if (enqueued) {

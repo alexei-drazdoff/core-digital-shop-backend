@@ -7,7 +7,7 @@
  * underneath them, which is why the handlers can stay this thin.
  */
 import type { Job, JobKind } from '../application/ports/queue.js';
-import type { JobHandler } from '../infrastructure/queue/worker.js';
+import { JobDeferredError, type JobHandler } from '../infrastructure/queue/worker.js';
 import type { Container } from './container.js';
 
 export function buildJobHandlers(container: Container): Readonly<Record<JobKind, JobHandler>> {
@@ -18,6 +18,15 @@ export function buildJobHandlers(container: Container): Readonly<Record<JobKind,
       const orderItemId = job.payload['orderItemId'];
       if (typeof orderItemId !== 'string') throw new Error('deliver_order_item job is missing orderItemId');
       const result = await useCases.deliverOrderItem.execute(orderItemId);
+
+      // No capacity at any supplier. Thrown rather than returned because the
+      // worker owns the queue, and thrown as its OWN type because a deferral is
+      // the opposite of a failure: nothing was tried, so nothing is charged and
+      // the job cannot die of waiting.
+      if (result.kind === 'rate_limited') {
+        throw new JobDeferredError(result.retryAfter, 'supplier rate limit reached');
+      }
+
       logger.debug({ order_item_id: orderItemId, result: result.kind }, 'delivery job finished');
     },
 
@@ -35,6 +44,11 @@ export function buildJobHandlers(container: Container): Readonly<Record<JobKind,
       const requestId = job.payload['requestId'];
       if (typeof requestId !== 'string') throw new Error('reconcile_supplier_request job is missing requestId');
       const result = await useCases.reconcileSupplierRequest.execute(requestId);
+
+      // No capacity to even ask. Waiting, not failing: the claim is untouched.
+      if (result.kind === 'rate_limited') {
+        throw new JobDeferredError(result.retryAfter, 'supplier rate limit reached');
+      }
 
       // Still no answer from the supplier. Throwing puts the job back on the
       // queue with backoff, which is exactly the retry the claim needs; silently

@@ -16,6 +16,26 @@ import { runWithContext } from '../observability/logger.js';
 
 export type JobHandler = (job: Job) => Promise<void>;
 
+/**
+ * Thrown by a handler that could not even start: no supplier capacity right now.
+ *
+ * A distinct type rather than a flag on the error message, because the worker
+ * has to treat it as the opposite of a failure. A failure spends an attempt and
+ * eventually kills the job; a deferral spends nothing, because nothing was
+ * tried. Collapsing the two would let a large enough burst quietly exterminate
+ * the jobs at the back of the queue — "ничего не теряется" failing in the one
+ * situation the requirement exists for.
+ */
+export class JobDeferredError extends Error {
+  constructor(
+    readonly retryAfter: Date,
+    readonly reason: string,
+  ) {
+    super(`job deferred until ${retryAfter.toISOString()}: ${reason}`);
+    this.name = 'JobDeferredError';
+  }
+}
+
 export interface WorkerOptions {
   readonly concurrency: number;
   readonly pollIntervalMs: number;
@@ -93,6 +113,16 @@ export class Worker {
         onJobFinished?.(job.kind, 'succeeded');
         logger.debug({ job_id: job.id, kind: job.kind, duration_ms: Date.now() - startedAt }, 'job completed');
       } catch (error) {
+        if (error instanceof JobDeferredError) {
+          // Not a failure. Back on the queue, nothing charged.
+          await queue.defer(exec, job.id, error.retryAfter, error.reason);
+          logger.debug(
+            { job_id: job.id, kind: job.kind, deferrals: job.deferrals, until: error.retryAfter },
+            'job deferred, waiting for supplier capacity',
+          );
+          return;
+        }
+
         const message = error instanceof Error ? error.message : String(error);
         const exhausted = job.attempts >= job.maxAttempts;
         await queue.fail(exec, job.id, message, exhausted ? null : new Date(Date.now() + jobRetryDelayMs(job.attempts)));

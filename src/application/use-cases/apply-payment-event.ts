@@ -15,7 +15,7 @@
  */
 import { decidePaymentEffect } from '../../domain/order/status.js';
 import { paymentCapturedEntries } from '../../domain/ledger/entries.js';
-import type { JobQueue } from '../ports/queue.js';
+import { JOB_PRIORITY, type JobQueue } from '../ports/queue.js';
 import type {
   IncomingPaymentEvent,
   LedgerRepository,
@@ -158,6 +158,9 @@ export class ApplyPaymentEventUseCase {
           kind: 'deliver_order_item',
           dedupeKey: deliveryJobDedupeKey(item.id),
           payload: { orderItemId: item.id },
+          // The money has just arrived, so this is the highest priority work in
+          // the system. When supplier capacity is scarce it goes first.
+          priority: JOB_PRIORITY.PAID_DELIVERY,
         });
       }
     }

@@ -6,7 +6,7 @@ import { replenishBody } from '../schemas.js';
 import { SUPPLIER_A } from '../../../shared/constants.js';
 
 export function registerAdminRoutes(app: AppServer, container: Container): void {
-  const { config, pool, uow, queue, repositories, useCases, logger } = container;
+  const { config, pool, uow, queue, rateLimiter, repositories, useCases, logger } = container;
 
   // A shared static token. Enough to keep operational endpoints off the public
   // surface without pretending this is a real identity system.
@@ -166,6 +166,63 @@ export function registerAdminRoutes(app: AppServer, container: Container): void 
     const order = await repositories.orders.findById(pool, id);
     if (!order) return reply.code(404).send({ error: 'order_not_found' });
     return useCases.settleOrder.execute(id);
+  });
+
+  /**
+   * Queue progress: "виден прогресс — сколько заказов в очереди и сколько уже выдано".
+   *
+   * Deliberately reports the QUEUE and the GOODS separately, because during a
+   * burst they answer different questions. The queue says how much work is
+   * waiting and how much of it is merely waiting for supplier capacity rather
+   * than failing; the lines say how much of what customers paid for has actually
+   * been handed over. A backlog with zero dead jobs and a healthy delivered
+   * count is a system absorbing a spike correctly, and the two numbers together
+   * are what make that visible instead of alarming.
+   */
+  app.get('/admin/queue/progress', async () => {
+    const [jobs, items, tokens] = await Promise.all([
+      pool.query<{ kind: string; state: string; count: number; deferrals: number; priority: number }>(
+        `SELECT kind, state, count(*)::int AS count,
+                COALESCE(SUM(deferrals), 0)::int AS deferrals,
+                MAX(priority)::int AS priority
+           FROM jobs
+          GROUP BY kind, state
+          ORDER BY kind, state`,
+      ),
+      pool.query<{ status: string; count: number }>(
+        `SELECT i.status, count(*)::int AS count
+           FROM order_items i
+           JOIN orders o ON o.id = i.order_id
+          WHERE o.paid_at IS NOT NULL
+          GROUP BY i.status
+          ORDER BY i.status`,
+      ),
+      rateLimiter.snapshot(pool),
+    ]);
+
+    const byStatus = new Map(items.rows.map((row) => [row.status, row.count]));
+    const waiting =
+      (byStatus.get('pending') ?? 0) +
+      (byStatus.get('delivering') ?? 0) +
+      (byStatus.get('out_of_stock') ?? 0) +
+      (byStatus.get('delivery_failed') ?? 0);
+
+    return {
+      jobs: jobs.rows,
+      // Jobs put back because a supplier had no capacity. Waiting, not failing:
+      // these never count against a job's attempts, so a burst cannot kill them.
+      pending_jobs: jobs.rows
+        .filter((row) => row.state === 'pending')
+        .reduce((total, row) => total + row.count, 0),
+      dead_jobs: jobs.rows.filter((row) => row.state === 'dead').reduce((total, row) => total + row.count, 0),
+      items: {
+        delivered: byStatus.get('delivered') ?? 0,
+        refunded: byStatus.get('refunded') ?? 0,
+        waiting,
+        by_status: Object.fromEntries(byStatus),
+      },
+      supplier_capacity: tokens,
+    };
   });
 
   /** Runs the recovery sweep on demand rather than waiting for the timer. */

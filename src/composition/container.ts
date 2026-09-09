@@ -25,6 +25,7 @@ import { PgReconciliationRepository } from '../infrastructure/db/repositories/re
 import { PgJobQueue } from '../infrastructure/queue/pg-job-queue.js';
 import { CircuitBreaker } from '../infrastructure/suppliers/circuit-breaker.js';
 import { HttpSupplierGateway } from '../infrastructure/suppliers/http-supplier-gateway.js';
+import { PgSupplierRateLimiter } from '../infrastructure/suppliers/pg-rate-limiter.js';
 
 import { systemClock, type Clock } from '../application/ports/clock.js';
 import type { SupplierGateway } from '../application/ports/supplier-gateway.js';
@@ -60,6 +61,7 @@ export interface Container {
     reconciliation: PgReconciliationRepository;
   };
   readonly queue: PgJobQueue;
+  readonly rateLimiter: PgSupplierRateLimiter;
   readonly useCases: {
     createOrder: CreateOrderUseCase;
     applyPaymentEvent: ApplyPaymentEventUseCase;
@@ -101,6 +103,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
   const idempotency = new PgIdempotencyRepository();
   const reconciliation = new PgReconciliationRepository(pool, ledger);
   const queue = new PgJobQueue();
+  const rateLimiter = new PgSupplierRateLimiter();
 
   // Order matters: the first supplier is primary and the rest are fallbacks.
   const suppliers: readonly SupplierGateway[] =
@@ -155,6 +158,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     issuedCodes,
     ledger,
     queue,
+    rateLimiter,
     suppliers,
     metrics,
     logger,
@@ -185,6 +189,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
     issuedCodes,
     ledger,
     queue,
+    rateLimiter,
     suppliers,
     metrics,
     logger,
@@ -235,6 +240,7 @@ export function buildContainer(options: BuildContainerOptions = {}): Container {
       reconciliation,
     },
     queue,
+    rateLimiter,
     useCases: {
       createOrder,
       applyPaymentEvent,
