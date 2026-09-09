@@ -49,7 +49,7 @@ export class PgReconciliationRepository implements ReconciliationRepository {
       this.deliveredNotPaid(),
       this.deliveredAndRefunded(),
       this.unsettledOrders(staleAfter),
-      this.unresolvedSupplierRequests(),
+      this.unresolvedSupplierRequests(staleAfter),
       this.orphanIssuances(),
       this.quarantinedCodes(),
       this.deferredPaymentEvents(),
@@ -196,7 +196,23 @@ export class PgReconciliationRepository implements ReconciliationRepository {
     return toRows(result.rows);
   }
 
-  private async unresolvedSupplierRequests(): Promise<ReconciliationRow[]> {
+  /**
+   * Supplier calls whose outcome is still unknown past the deadline.
+   *
+   * The deadline is not optional here, and leaving it out was a real bug.
+   * `beginAttempt` writes `in_flight` BEFORE the HTTP call — that is the whole
+   * point of it, since a row asserting "a side effect may exist" is the only
+   * evidence a crashed delivery leaves behind. So an in-flight row exists for
+   * the entire duration of every perfectly normal supplier conversation, and an
+   * unfiltered query would report every delivery in progress as a discrepancy.
+   * Since this list feeds the health verdict, `/admin/reconciliation` would have
+   * answered 409 whenever anything was being delivered.
+   *
+   * The same deadline the discrepancy sweep uses, deliberately: the report and
+   * the sweep must agree on what "stale" means, or the report accuses the system
+   * of exactly the claims the sweep has not yet been asked to chase.
+   */
+  private async unresolvedSupplierRequests(staleAfter: Date): Promise<ReconciliationRow[]> {
     const result = await this.exec.query<RawRow>(
       `SELECT sr.order_id, i.sku, sr.state AS status, i.price_minor AS amount_minor,
               'supplier ' || sr.supplier || ' outcome unknown, request ' || sr.request_id AS detail,
@@ -204,7 +220,9 @@ export class PgReconciliationRepository implements ReconciliationRepository {
          FROM supplier_requests sr
          JOIN order_items i ON i.id = sr.order_item_id
         WHERE sr.state IN ('in_flight', 'unknown')
+          AND sr.last_sent_at < $1
         ORDER BY sr.last_sent_at`,
+      [staleAfter],
     );
     return toRows(result.rows);
   }
